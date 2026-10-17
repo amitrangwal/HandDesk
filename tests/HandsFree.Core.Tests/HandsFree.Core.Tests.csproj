@@ -7,5 +7,6 @@
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\..\src\HandsFree.Core\HandsFree.Core.csproj" />
+    <ProjectReference Include="..\..\src\HandsFree.Windows\HandsFree.Windows.csproj" />
   </ItemGroup>
 </Project>
