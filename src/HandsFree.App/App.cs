@@ -1,7 +1,6 @@
 using Avalonia;
 using Avalonia.Controls.ApplicationLifetimes;
 using Avalonia.Markup.Xaml;
-using Avalonia.Themes.Fluent;
 
 namespace HandsFree.App;
 
@@ -9,7 +8,7 @@ public sealed class App : Application
 {
     public override void Initialize()
     {
-        Styles.Add(new FluentTheme());
+        AvaloniaXamlLoader.Load(this);
     }
 
     public override void OnFrameworkInitializationCompleted()

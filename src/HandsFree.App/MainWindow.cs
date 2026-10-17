@@ -2,7 +2,9 @@ using System.Globalization;
 using Avalonia.Controls;
 using Avalonia.Layout;
 using Avalonia.Media;
+using Avalonia;
 using Avalonia.Threading;
+using Avalonia.Styling;
 using HandsFree.Core;
 using HandsFree.Windows;
 
@@ -13,6 +15,14 @@ public sealed class MainWindow : Window
     private readonly WindowsControlAdapter _windowsAdapter = new();
     private readonly IControlEngine _controlEngine;
     private readonly ScrollTestModeController _scrollTestMode;
+    private readonly HandTrackingSession _handTracking;
+    private readonly DispatcherTimer _previewTimer = new() { Interval = TimeSpan.FromMilliseconds(33) };
+    private readonly HandPreviewControl _handPreview = new() { Height = 300, MinHeight = 220 };
+    private readonly Button _startTrackingButton = new() { Content = "Start Tracking", MinWidth = 130 };
+    private readonly Button _stopTrackingButton = new() { Content = "Stop Tracking", MinWidth = 130, IsEnabled = false };
+    private readonly Button _resetHandSelectionButton = new() { Content = "Reset Hand Lock", MinWidth = 130, IsEnabled = false };
+    private readonly TextBlock _trackingStatus = new() { Text = "Tracking is stopped.", TextWrapping = TextWrapping.Wrap };
+    private DateTimeOffset _lastPreviewTimestamp;
     private readonly TextBox _executablePath = new() { PlaceholderText = "Full path to an .exe", Width = 360 };
     private readonly TextBox _xCoordinate = new() { Text = "640", Width = 90 };
     private readonly TextBox _yCoordinate = new() { Text = "360", Width = 90 };
@@ -25,12 +35,17 @@ public sealed class MainWindow : Window
     private readonly Button _captureTargetButton = new() { Content = "Capture Target Window", MinWidth = 190 };
     private readonly Button _clearTargetButton = new() { Content = "Clear Target", MinWidth = 110, IsEnabled = false };
     private readonly TextBlock _targetStatus = new() { Text = "Target: None captured", TextWrapping = TextWrapping.Wrap };
+    private readonly Button _themeToggleButton = new() { Content = "Switch to dark theme", MinWidth = 160 };
+    private bool _darkTheme;
 
     public MainWindow()
     {
         _controlEngine = new ControlEngine(_windowsAdapter);
         _scrollTestMode = new ScrollTestModeController(new WindowsGlobalShortcutRegistrar(), _controlEngine, _windowsAdapter);
+        _handTracking = new HandTrackingSession(new WindowsHandTrackingProvider());
         _scrollTestMode.ActionCompleted += OnScrollActionCompleted;
+        _handTracking.StatusChanged += OnTrackingStatusChanged;
+        _previewTimer.Tick += OnPreviewTimerTick;
         Title = "HandsFree";
         Width = 720;
         Height = 720;
@@ -44,8 +59,9 @@ public sealed class MainWindow : Window
             Spacing = 16,
             Children =
             {
-                new TextBlock { Text = "HandsFree", FontSize = 32, FontWeight = FontWeight.SemiBold },
+                new StackPanel { Orientation = Orientation.Horizontal, Spacing = 12, Children = { new TextBlock { Text = "HandsFree", FontSize = 32, FontWeight = FontWeight.SemiBold, VerticalAlignment = VerticalAlignment.Center }, _themeToggleButton } },
                 new TextBlock { Text = "A local-first foundation for hands-free interaction.", FontSize = 16 },
+                HandTrackingControls(),
                 new TextBlock { Text = "Manual Windows control test", FontSize = 20, FontWeight = FontWeight.Medium },
                 new TextBlock { Text = "Each button performs one explicit action. Nothing runs automatically.", TextWrapping = TextWrapping.Wrap },
                 LaunchRow(),
@@ -56,7 +72,7 @@ public sealed class MainWindow : Window
                 {
                     Padding = new Avalonia.Thickness(16),
                     CornerRadius = new Avalonia.CornerRadius(8),
-                    Background = new SolidColorBrush(Color.Parse("#F1F3F5")),
+                    Classes = { "status-card" },
                     Child = _status
                 }
             }
@@ -71,15 +87,118 @@ public sealed class MainWindow : Window
         _scrollModeButton.Click += (_, _) => ToggleScrollTestMode();
         _captureTargetButton.Click += (_, _) => ArmTargetCapture();
         _clearTargetButton.Click += (_, _) => ClearTarget();
-        Closed += (_, _) => _scrollTestMode.Dispose();
+        _themeToggleButton.Click += (_, _) => ToggleTheme();
+        _startTrackingButton.IsEnabled = OperatingSystem.IsWindows();
+        if (!OperatingSystem.IsWindows()) _trackingStatus.Text = "Local webcam tracking is available on Windows only.";
+        _startTrackingButton.Click += async (_, _) => await StartTrackingAsync();
+        _stopTrackingButton.Click += async (_, _) => await StopTrackingAsync();
+        _resetHandSelectionButton.Click += (_, _) => ResetHandSelection();
+        Closed += (_, _) =>
+        {
+            _previewTimer.Stop();
+            _scrollTestMode.Dispose();
+            _handPreview.Dispose();
+            _handTracking.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        };
         Content = new ScrollViewer { Content = controls };
+    }
+
+    private Control HandTrackingControls() => new Border
+    {
+        Padding = new Avalonia.Thickness(16),
+        CornerRadius = new Avalonia.CornerRadius(8),
+        Classes = { "section-card" },
+        Child = new StackPanel
+        {
+            Spacing = 10,
+            Children =
+            {
+                new TextBlock { Text = "Local hand tracking", FontSize = 20, FontWeight = FontWeight.Medium },
+                new TextBlock { Text = "Camera access starts only when requested. One hand and its 21 landmarks are shown locally; tracking never controls the desktop.", TextWrapping = TextWrapping.Wrap },
+                new TextBlock { Text = "Preferred hand: Right hand only", FontWeight = FontWeight.Medium },
+                new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8, Children = { _startTrackingButton, _stopTrackingButton, _resetHandSelectionButton } },
+                _trackingStatus,
+                _handPreview
+            }
+        }
+    };
+
+    private void ToggleTheme()
+    {
+        _darkTheme = !_darkTheme;
+        Application.Current!.RequestedThemeVariant = _darkTheme ? ThemeVariant.Dark : ThemeVariant.Light;
+        _themeToggleButton.Content = _darkTheme ? "Switch to light theme" : "Switch to dark theme";
+    }
+
+    private async Task StartTrackingAsync()
+    {
+        _startTrackingButton.IsEnabled = false;
+        _trackingStatus.Text = "Starting camera and local inference…";
+        await _handTracking.StartAsync();
+        var running = _handTracking.Status.State == HandTrackingState.Running;
+        _previewTimer.IsEnabled = running;
+        _startTrackingButton.IsEnabled = !running && OperatingSystem.IsWindows();
+        _stopTrackingButton.IsEnabled = running;
+        _resetHandSelectionButton.IsEnabled = running;
+    }
+
+    private async Task StopTrackingAsync()
+    {
+        _previewTimer.Stop();
+        _stopTrackingButton.IsEnabled = false;
+        _resetHandSelectionButton.IsEnabled = false;
+        await _handTracking.StopAsync();
+        _handPreview.Clear();
+        _lastPreviewTimestamp = default;
+        _startTrackingButton.IsEnabled = OperatingSystem.IsWindows();
+    }
+
+    private void ResetHandSelection()
+    {
+        _handTracking.ResetHandSelection();
+        _lastPreviewTimestamp = default;
+        _handPreview.Clear();
+        _trackingStatus.Text = "Hand lock reset. Waiting for a visible hand to select.";
+    }
+
+    private void OnTrackingStatusChanged(HandTrackingStatus status) => Dispatcher.UIThread.Post(() =>
+    {
+        _trackingStatus.Text = status.Message;
+        if (status.State is HandTrackingState.Faulted or HandTrackingState.Stopped or HandTrackingState.Disposed)
+        {
+            _previewTimer.Stop();
+            _startTrackingButton.IsEnabled = status.State != HandTrackingState.Disposed && OperatingSystem.IsWindows();
+            _stopTrackingButton.IsEnabled = false;
+            _resetHandSelectionButton.IsEnabled = false;
+        }
+        else if (status.State == HandTrackingState.Running)
+        {
+            _startTrackingButton.IsEnabled = false;
+            _stopTrackingButton.IsEnabled = true;
+            _resetHandSelectionButton.IsEnabled = true;
+            _previewTimer.Start();
+        }
+    });
+
+    private void OnPreviewTimerTick(object? sender, EventArgs args)
+    {
+        var frame = _handTracking.LatestFrame;
+        if (frame is null || frame.CapturedAt == _lastPreviewTimestamp) return;
+        _lastPreviewTimestamp = frame.CapturedAt;
+        _handPreview.UpdateFrame(frame);
+        _trackingStatus.Text = frame.IdentityState switch
+        {
+            HandTrackingIdentityState.Tracking => $"Hand detected: 21 landmarks • {frame.Result.Confidence:P0} confidence • local CPU inference",
+            HandTrackingIdentityState.Searching => frame.TrackingMessage,
+            _ => frame.TrackingMessage
+        };
     }
 
     private Control ScrollTestModeControls() => new Border
     {
         Padding = new Avalonia.Thickness(16),
         CornerRadius = new Avalonia.CornerRadius(8),
-        Background = new SolidColorBrush(Color.Parse("#F1F3F5")),
+        Classes = { "section-card" },
         Child = new StackPanel
         {
             Spacing = 10,

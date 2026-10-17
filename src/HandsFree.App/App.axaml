@@ -1,0 +1,79 @@
+<Application xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:local="using:HandsFree.App"
+             x:Class="HandsFree.App.App"
+             RequestedThemeVariant="Light">
+  <Application.Styles>
+    <FluentTheme />
+    <Style Selector="Window">
+      <Setter Property="Background" Value="{DynamicResource AppBackgroundBrush}" />
+      <Setter Property="Foreground" Value="{DynamicResource AppForegroundBrush}" />
+    </Style>
+    <Style Selector="TextBlock">
+      <Setter Property="Foreground" Value="{DynamicResource AppForegroundBrush}" />
+    </Style>
+    <Style Selector="Button">
+      <Setter Property="Background" Value="{DynamicResource ButtonBackgroundBrush}" />
+      <Setter Property="Foreground" Value="{DynamicResource ButtonForegroundBrush}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource ControlBorderBrush}" />
+    </Style>
+    <Style Selector="Button:pointerover">
+      <Setter Property="Background" Value="{DynamicResource ButtonHoverBrush}" />
+    </Style>
+    <Style Selector="Button:pressed">
+      <Setter Property="Background" Value="{DynamicResource ButtonPressedBrush}" />
+    </Style>
+    <Style Selector="Button:disabled">
+      <Setter Property="Background" Value="{DynamicResource ButtonDisabledBrush}" />
+      <Setter Property="Foreground" Value="{DynamicResource DisabledForegroundBrush}" />
+    </Style>
+    <Style Selector="TextBox">
+      <Setter Property="Background" Value="{DynamicResource InputBackgroundBrush}" />
+      <Setter Property="Foreground" Value="{DynamicResource AppForegroundBrush}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource ControlBorderBrush}" />
+      <Setter Property="CaretBrush" Value="{DynamicResource AppForegroundBrush}" />
+      <Setter Property="SelectionBrush" Value="{DynamicResource SelectionBrush}" />
+    </Style>
+    <Style Selector="Border.section-card, Border.status-card">
+      <Setter Property="Background" Value="{DynamicResource PanelBackgroundBrush}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource ControlBorderBrush}" />
+      <Setter Property="BorderThickness" Value="1" />
+    </Style>
+  </Application.Styles>
+  <Application.Resources>
+    <ResourceDictionary>
+      <ResourceDictionary.ThemeDictionaries>
+        <ResourceDictionary x:Key="Light">
+          <SolidColorBrush x:Key="AppBackgroundBrush" Color="#FFF7F8FA" />
+          <SolidColorBrush x:Key="AppForegroundBrush" Color="#FF1B1B1F" />
+          <SolidColorBrush x:Key="PanelBackgroundBrush" Color="#FFFFFFFF" />
+          <SolidColorBrush x:Key="InputBackgroundBrush" Color="#FFFFFFFF" />
+          <SolidColorBrush x:Key="ControlBorderBrush" Color="#FF737780" />
+          <SolidColorBrush x:Key="ButtonBackgroundBrush" Color="#FFE9ECF2" />
+          <SolidColorBrush x:Key="ButtonForegroundBrush" Color="#FF1B1B1F" />
+          <SolidColorBrush x:Key="ButtonHoverBrush" Color="#FFDDE2EA" />
+          <SolidColorBrush x:Key="ButtonPressedBrush" Color="#FFCBD3DF" />
+          <SolidColorBrush x:Key="ButtonDisabledBrush" Color="#FFE8E9EC" />
+          <SolidColorBrush x:Key="DisabledForegroundBrush" Color="#FF5D6068" />
+          <SolidColorBrush x:Key="SelectionBrush" Color="#FF5576C5" />
+          <SolidColorBrush x:Key="PreviewBackgroundBrush" Color="#FF202124" />
+        </ResourceDictionary>
+        <ResourceDictionary x:Key="Dark">
+          <SolidColorBrush x:Key="AppBackgroundBrush" Color="#FF17181C" />
+          <SolidColorBrush x:Key="AppForegroundBrush" Color="#FFF1F0F7" />
+          <SolidColorBrush x:Key="PanelBackgroundBrush" Color="#FF24262C" />
+          <SolidColorBrush x:Key="InputBackgroundBrush" Color="#FF202227" />
+          <SolidColorBrush x:Key="ControlBorderBrush" Color="#FF9296A1" />
+          <SolidColorBrush x:Key="ButtonBackgroundBrush" Color="#FF343740" />
+          <SolidColorBrush x:Key="ButtonForegroundBrush" Color="#FFF1F0F7" />
+          <SolidColorBrush x:Key="ButtonHoverBrush" Color="#FF454954" />
+          <SolidColorBrush x:Key="ButtonPressedBrush" Color="#FF555B68" />
+          <SolidColorBrush x:Key="ButtonDisabledBrush" Color="#FF2A2C32" />
+          <SolidColorBrush x:Key="DisabledForegroundBrush" Color="#FFB5B7C0" />
+          <SolidColorBrush x:Key="SelectionBrush" Color="#FF7898EA" />
+          <SolidColorBrush x:Key="PreviewBackgroundBrush" Color="#FF101114" />
+        </ResourceDictionary>
+      </ResourceDictionary.ThemeDictionaries>
+    </ResourceDictionary>
+  </Application.Resources>
+</Application>
