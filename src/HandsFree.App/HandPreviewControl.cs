@@ -22,6 +22,7 @@ internal sealed class HandPreviewControl : Control, IDisposable
     private WriteableBitmap? _bitmap;
     private byte[] _convertedBuffer = [];
     private IReadOnlyList<HandLandmark> _landmarks = Array.Empty<HandLandmark>();
+    private PointerMovementWindow _movementWindow = PointerMovementWindow.Default;
 
     public HandPreviewControl()
     {
@@ -65,6 +66,12 @@ internal sealed class HandPreviewControl : Control, IDisposable
         InvalidateVisual();
     }
 
+    public void SetMovementWindow(PointerMovementWindow window)
+    {
+        _movementWindow = window;
+        InvalidateVisual();
+    }
+
     public void Clear()
     {
         _bitmap?.Dispose();
@@ -92,6 +99,13 @@ internal sealed class HandPreviewControl : Control, IDisposable
         var top = (Bounds.Height - height) / 2;
         var imageRect = new Rect(left, top, width, height);
         context.DrawImage(_bitmap, new Rect(0, 0, imageWidth, imageHeight), imageRect);
+        if (_movementWindow.IsValid)
+        {
+            var area = new Rect(left + _movementWindow.Left * width, top + _movementWindow.Top * height,
+                _movementWindow.Width * width, _movementWindow.Height * height);
+            var windowPen = new Pen(new SolidColorBrush(Color.Parse("#FFFFC857")), 2.5);
+            context.DrawRectangle(null, windowPen, area);
+        }
         if (_landmarks.Count != 21) return;
 
         Point At(int index) => new(left + (1 - _landmarks[index].X) * width, top + _landmarks[index].Y * height);

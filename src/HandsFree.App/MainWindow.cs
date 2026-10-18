@@ -16,12 +16,35 @@ public sealed class MainWindow : Window
     private readonly IControlEngine _controlEngine;
     private readonly ScrollTestModeController _scrollTestMode;
     private readonly HandTrackingSession _handTracking;
+    private readonly HandLandmarkDataCollector _landmarkCollector = new();
+    private readonly IndexFingerPointerMapper _pointerMapper = new();
+    private PointerMovementWindow _pointerWindow = PointerMovementWindow.Default;
     private readonly DispatcherTimer _previewTimer = new() { Interval = TimeSpan.FromMilliseconds(33) };
+    private readonly DispatcherTimer _resourceTimer = new() { Interval = TimeSpan.FromSeconds(1) };
+    private readonly WindowsProcessResourceSampler _processResourceSampler = new();
     private readonly HandPreviewControl _handPreview = new() { Height = 300, MinHeight = 220 };
+    private readonly SimulatedDesktopControl _simulatedDesktop = new() { Height = 220, MinHeight = 170 };
+    private readonly TextBlock _pointerStatus = new() { Text = "Pointer simulation is disabled.", TextWrapping = TextWrapping.Wrap };
+    private readonly Button _pointerToggleButton = new() { Content = "Enable pointer simulation", MinWidth = 190, IsEnabled = false };
+    private readonly Slider _windowLeft = new() { Minimum = 0, Maximum = 1, Value = 0.2, Width = 220 };
+    private readonly Slider _windowTop = new() { Minimum = 0, Maximum = 1, Value = 0.1, Width = 220 };
+    private readonly Slider _windowWidth = new() { Minimum = 0.1, Maximum = 1, Value = 0.6, Width = 220 };
+    private readonly Slider _windowHeight = new() { Minimum = 0.1, Maximum = 1, Value = 0.8, Width = 220 };
+    private bool _updatingWindowControls;
+    private bool _pointerSimulationEnabled;
     private readonly Button _startTrackingButton = new() { Content = "Start Tracking", MinWidth = 130 };
     private readonly Button _stopTrackingButton = new() { Content = "Stop Tracking", MinWidth = 130, IsEnabled = false };
     private readonly Button _resetHandSelectionButton = new() { Content = "Reset Hand Lock", MinWidth = 130, IsEnabled = false };
     private readonly TextBlock _trackingStatus = new() { Text = "Tracking is stopped.", TextWrapping = TextWrapping.Wrap };
+    private readonly TextBlock _processCpuMetric = new() { Text = "Process CPU: sampling…", TextWrapping = TextWrapping.Wrap };
+    private readonly TextBlock _memoryMetric = new() { Text = "Memory: sampling…", TextWrapping = TextWrapping.Wrap };
+    private readonly TextBlock _inferenceMetric = new() { Text = "Inference: idle", TextWrapping = TextWrapping.Wrap };
+    private readonly TextBlock _trackingRateMetric = new() { Text = "Tracking rate: idle", TextWrapping = TextWrapping.Wrap };
+    private readonly TextBlock _droppedFramesMetric = new() { Text = "Dropped frames: idle", TextWrapping = TextWrapping.Wrap };
+    private readonly TextBox _gestureLabel = new() { PlaceholderText = "Gesture label (required)", Width = 200 };
+    private readonly Button _startCollectionButton = new() { Content = "Start Collection", MinWidth = 140, IsEnabled = false };
+    private readonly Button _stopCollectionButton = new() { Content = "Stop Collection", MinWidth = 140, IsEnabled = false };
+    private readonly TextBlock _collectionStatus = new() { Text = "Collection is stopped.", TextWrapping = TextWrapping.Wrap };
     private DateTimeOffset _lastPreviewTimestamp;
     private readonly TextBox _executablePath = new() { PlaceholderText = "Full path to an .exe", Width = 360 };
     private readonly TextBox _xCoordinate = new() { Text = "640", Width = 90 };
@@ -45,7 +68,9 @@ public sealed class MainWindow : Window
         _handTracking = new HandTrackingSession(new WindowsHandTrackingProvider());
         _scrollTestMode.ActionCompleted += OnScrollActionCompleted;
         _handTracking.StatusChanged += OnTrackingStatusChanged;
+        _landmarkCollector.StatusChanged += OnCollectionStatusChanged;
         _previewTimer.Tick += OnPreviewTimerTick;
+        _resourceTimer.Tick += OnResourceTimerTick;
         Title = "HandsFree";
         Width = 720;
         Height = 720;
@@ -62,6 +87,7 @@ public sealed class MainWindow : Window
                 new StackPanel { Orientation = Orientation.Horizontal, Spacing = 12, Children = { new TextBlock { Text = "HandsFree", FontSize = 32, FontWeight = FontWeight.SemiBold, VerticalAlignment = VerticalAlignment.Center }, _themeToggleButton } },
                 new TextBlock { Text = "A local-first foundation for hands-free interaction.", FontSize = 16 },
                 HandTrackingControls(),
+                ResourceMonitorControls(),
                 new TextBlock { Text = "Manual Windows control test", FontSize = 20, FontWeight = FontWeight.Medium },
                 new TextBlock { Text = "Each button performs one explicit action. Nothing runs automatically.", TextWrapping = TextWrapping.Wrap },
                 LaunchRow(),
@@ -93,14 +119,29 @@ public sealed class MainWindow : Window
         _startTrackingButton.Click += async (_, _) => await StartTrackingAsync();
         _stopTrackingButton.Click += async (_, _) => await StopTrackingAsync();
         _resetHandSelectionButton.Click += (_, _) => ResetHandSelection();
+        _startCollectionButton.Click += async (_, _) => await StartCollectionAsync();
+        _stopCollectionButton.Click += async (_, _) => await StopCollectionAsync();
+        _pointerToggleButton.Click += (_, _) => TogglePointerSimulation();
+        _windowLeft.ValueChanged += (_, _) => UpdateMovementWindow();
+        _windowTop.ValueChanged += (_, _) => UpdateMovementWindow();
+        _windowWidth.ValueChanged += (_, _) => UpdateMovementWindow();
+        _windowHeight.ValueChanged += (_, _) => UpdateMovementWindow();
+        _handPreview.SetMovementWindow(_pointerWindow);
         Closed += (_, _) =>
         {
             _previewTimer.Stop();
+            _resourceTimer.Stop();
+            _resourceTimer.Tick -= OnResourceTimerTick;
+            _processResourceSampler.Dispose();
             _scrollTestMode.Dispose();
             _handPreview.Dispose();
+            _landmarkCollector.StatusChanged -= OnCollectionStatusChanged;
+            _landmarkCollector.DisposeAsync().AsTask().GetAwaiter().GetResult();
             _handTracking.DisposeAsync().AsTask().GetAwaiter().GetResult();
         };
         Content = new ScrollViewer { Content = controls };
+        UpdateResourceMetrics();
+        _resourceTimer.Start();
     }
 
     private Control HandTrackingControls() => new Border
@@ -117,11 +158,84 @@ public sealed class MainWindow : Window
                 new TextBlock { Text = "Camera access starts only when requested. One hand and its 21 landmarks are shown locally; tracking never controls the desktop.", TextWrapping = TextWrapping.Wrap },
                 new TextBlock { Text = "Preferred hand: Right hand only", FontWeight = FontWeight.Medium },
                 new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8, Children = { _startTrackingButton, _stopTrackingButton, _resetHandSelectionButton } },
+                new TextBlock { Text = "Local landmark data collection", FontSize = 16, FontWeight = FontWeight.Medium },
+                new TextBlock { Text = "Collect labeled 21-point samples to a local JSONL file. Collection starts only on request and never triggers computer-control actions.", TextWrapping = TextWrapping.Wrap },
+                new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8, Children = { _gestureLabel, _startCollectionButton, _stopCollectionButton } },
+                _collectionStatus,
                 _trackingStatus,
-                _handPreview
+                _handPreview,
+                new TextBlock { Text = "Index-finger pointer prototype (simulation only)", FontSize = 16, FontWeight = FontWeight.Medium },
+                new TextBlock { Text = "Extend the index finger while curling the other fingers. Only fingertip 8 is used. Adjust the yellow movement window; the simulated desktop never sends OS input.", TextWrapping = TextWrapping.Wrap },
+                new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8, Children = { new TextBlock { Text = "Window left", VerticalAlignment = VerticalAlignment.Center, Width = 90 }, _windowLeft } },
+                new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8, Children = { new TextBlock { Text = "Window top", VerticalAlignment = VerticalAlignment.Center, Width = 90 }, _windowTop } },
+                new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8, Children = { new TextBlock { Text = "Window width", VerticalAlignment = VerticalAlignment.Center, Width = 90 }, _windowWidth } },
+                new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8, Children = { new TextBlock { Text = "Window height", VerticalAlignment = VerticalAlignment.Center, Width = 90 }, _windowHeight } },
+                new StackPanel { Orientation = Orientation.Horizontal, Spacing = 12, Children = { _pointerToggleButton, _pointerStatus } },
+                _simulatedDesktop
             }
         }
     };
+
+    private Control ResourceMonitorControls() => new Border
+    {
+        Padding = new Avalonia.Thickness(14),
+        CornerRadius = new Avalonia.CornerRadius(8),
+        Classes = { "section-card" },
+        Child = new StackPanel
+        {
+            Spacing = 5,
+            Children =
+            {
+                new TextBlock { Text = "Resource monitor", FontWeight = FontWeight.Medium },
+                _processCpuMetric,
+                _memoryMetric,
+                _inferenceMetric,
+                _trackingRateMetric,
+                _droppedFramesMetric
+            }
+        }
+    };
+
+    private void OnResourceTimerTick(object? sender, EventArgs args) => UpdateResourceMetrics();
+
+    private void UpdateResourceMetrics()
+    {
+        try
+        {
+            var process = _processResourceSampler.Sample();
+            _processCpuMetric.Text = process.ProcessCpuPercent is { } cpu
+                ? $"Process CPU (100% = one logical core): {cpu:F1}%"
+                : "Process CPU (100% = one logical core): sampling baseline…";
+            _memoryMetric.Text = $"Memory: working set {ToMiB(process.WorkingSetBytes):F1} MiB • managed heap {ToMiB(process.ManagedHeapBytes):F1} MiB";
+        }
+        catch (Exception exception)
+        {
+            _processCpuMetric.Text = "Process CPU: unavailable";
+            _memoryMetric.Text = $"Memory: unavailable ({exception.Message})";
+        }
+
+        if (_handTracking.Status.State != HandTrackingState.Running)
+        {
+            _inferenceMetric.Text = "Inference latency: idle";
+            _trackingRateMetric.Text = "Tracking FPS: idle";
+            _droppedFramesMetric.Text = "Dropped frames: idle";
+            return;
+        }
+
+        var metrics = _handTracking.Metrics;
+        var collection = _landmarkCollector.Status;
+        if (collection.State == HandLandmarkCollectionState.Recording)
+            _collectionStatus.Text = $"{collection.Message} Samples saved: {collection.SamplesWritten:N0} • skipped: {collection.SamplesDropped:N0}";
+        _inferenceMetric.Text = metrics.LastOnnxLatencyMilliseconds is { } last
+            && metrics.AverageOnnxLatencyMilliseconds is { } average
+            && metrics.P95OnnxLatencyMilliseconds is { } p95
+            ? $"ONNX inference: last {last:F1} ms • avg {average:F1} ms • p95 {p95:F1} ms"
+            : "ONNX inference: warming up…";
+        _trackingRateMetric.Text = $"Tracking FPS: {metrics.FramesPerSecond:F1} • processed {metrics.ProcessedFrames:N0}";
+        _droppedFramesMetric.Text = $"Dropped captured frames: {metrics.DroppedFrames:N0}";
+    }
+
+    private static double ToMiB(long bytes) => bytes / (1024d * 1024d);
 
     private void ToggleTheme()
     {
@@ -140,17 +254,26 @@ public sealed class MainWindow : Window
         _startTrackingButton.IsEnabled = !running && OperatingSystem.IsWindows();
         _stopTrackingButton.IsEnabled = running;
         _resetHandSelectionButton.IsEnabled = running;
+        _startCollectionButton.IsEnabled = running;
+        _pointerToggleButton.IsEnabled = running;
     }
 
     private async Task StopTrackingAsync()
     {
+        await StopCollectionAsync();
         _previewTimer.Stop();
         _stopTrackingButton.IsEnabled = false;
         _resetHandSelectionButton.IsEnabled = false;
         await _handTracking.StopAsync();
         _handPreview.Clear();
+        _pointerSimulationEnabled = false;
+        _pointerToggleButton.Content = "Enable pointer simulation";
+        _pointerMapper.Reset();
+        _simulatedDesktop.UpdateState(new IndexFingerPointerState(false, false, null, IndexFingerPoseFailure.NoHand, "Pointer simulation is disabled."));
+        _pointerStatus.Text = "Pointer simulation is disabled.";
         _lastPreviewTimestamp = default;
         _startTrackingButton.IsEnabled = OperatingSystem.IsWindows();
+        _startCollectionButton.IsEnabled = false;
     }
 
     private void ResetHandSelection()
@@ -170,12 +293,23 @@ public sealed class MainWindow : Window
             _startTrackingButton.IsEnabled = status.State != HandTrackingState.Disposed && OperatingSystem.IsWindows();
             _stopTrackingButton.IsEnabled = false;
             _resetHandSelectionButton.IsEnabled = false;
+            _startCollectionButton.IsEnabled = false;
+            _pointerToggleButton.IsEnabled = false;
+            _pointerSimulationEnabled = false;
+            _pointerToggleButton.Content = "Enable pointer simulation";
+            _pointerMapper.Reset();
+            _simulatedDesktop.UpdateState(new IndexFingerPointerState(false, false, null, IndexFingerPoseFailure.NoHand, "Tracking stopped; pointer simulation paused."));
+            _pointerStatus.Text = "Tracking stopped; pointer simulation paused.";
+            if (_landmarkCollector.Status.State == HandLandmarkCollectionState.Recording)
+                _ = StopCollectionAsync();
         }
         else if (status.State == HandTrackingState.Running)
         {
             _startTrackingButton.IsEnabled = false;
             _stopTrackingButton.IsEnabled = true;
             _resetHandSelectionButton.IsEnabled = true;
+            _startCollectionButton.IsEnabled = true;
+            _pointerToggleButton.IsEnabled = true;
             _previewTimer.Start();
         }
     });
@@ -186,12 +320,94 @@ public sealed class MainWindow : Window
         if (frame is null || frame.CapturedAt == _lastPreviewTimestamp) return;
         _lastPreviewTimestamp = frame.CapturedAt;
         _handPreview.UpdateFrame(frame);
+        if (_pointerSimulationEnabled)
+        {
+            var pointerState = _pointerMapper.Update(frame.Result, frame.IdentityState == HandTrackingIdentityState.Tracking,
+                _pointerWindow, previewMirrored: true, desktopWidth: 1280, desktopHeight: 720);
+            _simulatedDesktop.UpdateState(pointerState);
+            _pointerStatus.Text = pointerState.Message;
+        }
+        if (frame.IdentityState == HandTrackingIdentityState.Tracking && frame.Result.IsDetected)
+            _landmarkCollector.TryRecord(frame, _gestureLabel.Text ?? string.Empty);
+        else
+            _landmarkCollector.NotifyTrackingLost(frame.TrackingMessage);
         _trackingStatus.Text = frame.IdentityState switch
         {
             HandTrackingIdentityState.Tracking => $"Hand detected: 21 landmarks • {frame.Result.Confidence:P0} confidence • local CPU inference",
             HandTrackingIdentityState.Searching => frame.TrackingMessage,
             _ => frame.TrackingMessage
         };
+    }
+
+    private void TogglePointerSimulation()
+    {
+        _pointerSimulationEnabled = !_pointerSimulationEnabled;
+        _pointerToggleButton.Content = _pointerSimulationEnabled ? "Disable pointer simulation" : "Enable pointer simulation";
+        if (!_pointerSimulationEnabled)
+        {
+            _pointerMapper.Reset();
+            _pointerStatus.Text = "Pointer simulation is disabled.";
+            _simulatedDesktop.UpdateState(new IndexFingerPointerState(false, false, null, IndexFingerPoseFailure.NoHand, _pointerStatus.Text));
+        }
+        else
+        {
+            _pointerStatus.Text = "Pointer simulation enabled. Waiting for a recognized index pose.";
+        }
+    }
+
+    private void UpdateMovementWindow()
+    {
+        if (_updatingWindowControls) return;
+        var width = Math.Clamp(_windowWidth.Value, 0.1, 1);
+        var height = Math.Clamp(_windowHeight.Value, 0.1, 1);
+        var left = Math.Clamp(_windowLeft.Value, 0, 1 - width);
+        var top = Math.Clamp(_windowTop.Value, 0, 1 - height);
+        _updatingWindowControls = true;
+        _windowLeft.Value = left;
+        _windowTop.Value = top;
+        _windowWidth.Value = width;
+        _windowHeight.Value = height;
+        _updatingWindowControls = false;
+        _pointerWindow = new PointerMovementWindow(left, top, width, height);
+        _handPreview.SetMovementWindow(_pointerWindow);
+        _pointerMapper.Reset();
+    }
+
+    private async Task StartCollectionAsync()
+    {
+        if (_handTracking.Status.State != HandTrackingState.Running)
+        {
+            _collectionStatus.Text = "Start hand tracking before collecting samples.";
+            return;
+        }
+        _startCollectionButton.IsEnabled = false;
+        var started = await _landmarkCollector.StartAsync(_gestureLabel.Text ?? string.Empty);
+        _startCollectionButton.IsEnabled = !started && _handTracking.Status.State == HandTrackingState.Running;
+        _stopCollectionButton.IsEnabled = started;
+        UpdateCollectionStatus();
+    }
+
+    private async Task StopCollectionAsync()
+    {
+        _stopCollectionButton.IsEnabled = false;
+        await _landmarkCollector.StopAsync();
+        _startCollectionButton.IsEnabled = _handTracking.Status.State == HandTrackingState.Running;
+        UpdateCollectionStatus();
+    }
+
+    private void OnCollectionStatusChanged(HandLandmarkCollectionStatus status) => Dispatcher.UIThread.Post(() =>
+    {
+        _stopCollectionButton.IsEnabled = status.State == HandLandmarkCollectionState.Recording;
+        _startCollectionButton.IsEnabled = status.State != HandLandmarkCollectionState.Recording
+            && _handTracking.Status.State == HandTrackingState.Running;
+        UpdateCollectionStatus();
+    });
+
+    private void UpdateCollectionStatus()
+    {
+        var status = _landmarkCollector.Status;
+        var path = status.FilePath is null ? string.Empty : $" File: {status.FilePath}";
+        _collectionStatus.Text = $"{status.Message} Samples saved: {status.SamplesWritten:N0} • skipped: {status.SamplesDropped:N0}.{path}";
     }
 
     private Control ScrollTestModeControls() => new Border

@@ -27,6 +27,10 @@ public sealed class HandTrackingSession : IAsyncDisposable
 
     public HandTrackingFrame? LatestFrame => Volatile.Read(ref _latestFrame);
 
+    public HandTrackingMetricsSnapshot Metrics => Status.State == HandTrackingState.Running
+        ? _provider.Metrics
+        : HandTrackingMetricsSnapshot.Idle;
+
     /// <summary>Explicitly releases the current identity lock so the next candidate can be selected.</summary>
     public void ResetHandSelection()
     {
@@ -77,10 +81,12 @@ public sealed class HandTrackingSession : IAsyncDisposable
             try
             {
                 await _provider.StopAsync(cancellationToken).ConfigureAwait(false);
+                Interlocked.Exchange(ref _latestFrame, null);
                 SetStatus(HandTrackingState.Stopped, "Tracking is stopped.");
             }
             catch (Exception exception)
             {
+                Interlocked.Exchange(ref _latestFrame, null);
                 SetStatus(HandTrackingState.Faulted, $"Tracking stopped with a cleanup error: {FriendlyError(exception)}");
             }
         }
@@ -115,11 +121,15 @@ public sealed class HandTrackingSession : IAsyncDisposable
 
     private void OnFrameAvailable(HandTrackingFrame frame)
     {
-        if (_disposed || frame.Width <= 0 || frame.Height <= 0
+        if (frame.Width <= 0 || frame.Height <= 0
             || frame.BgrPixels.Length != (long)frame.Width * frame.Height * 3
             || frame.Result is null
             || (frame.Result.IsDetected && frame.Result.Landmarks.Count != 21)) return;
-        Interlocked.Exchange(ref _latestFrame, frame);
+        lock (_stateGate)
+        {
+            if (_disposed || _status.State is not (HandTrackingState.Starting or HandTrackingState.Running)) return;
+            Volatile.Write(ref _latestFrame, frame);
+        }
     }
 
     private void OnProviderStatusChanged(string message)
@@ -129,17 +139,23 @@ public sealed class HandTrackingSession : IAsyncDisposable
             SetStatus(current.State, message);
     }
 
-    private void OnProviderFaulted(string message) => _ = HandleProviderFaultAsync(message);
+    private void OnProviderFaulted(string message)
+    {
+        if (Status.State is HandTrackingState.Starting or HandTrackingState.Running)
+            _ = HandleProviderFaultAsync(message);
+    }
 
     private async Task HandleProviderFaultAsync(string message)
     {
         await _lifecycle.WaitAsync().ConfigureAwait(false);
         try
         {
-            if (_disposed) return;
+            if (_disposed || Status.State is not (HandTrackingState.Starting or HandTrackingState.Running)) return;
+            SetStatus(HandTrackingState.Stopping, "Tracking failed; releasing camera and inference resources…");
             Interlocked.Exchange(ref _latestFrame, null);
             try { await _provider.StopAsync().ConfigureAwait(false); }
             catch { /* Preserve the originating camera/inference error in the visible status. */ }
+            Interlocked.Exchange(ref _latestFrame, null);
             SetStatus(HandTrackingState.Faulted, message);
         }
         finally

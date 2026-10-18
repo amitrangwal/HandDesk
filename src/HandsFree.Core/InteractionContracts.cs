@@ -150,6 +150,7 @@ public interface IHandTrackingProvider : IAsyncDisposable
     event Action<HandTrackingFrame>? FrameAvailable;
     event Action<string>? StatusChanged;
     event Action<string>? Faulted;
+    HandTrackingMetricsSnapshot Metrics { get; }
     Task StartAsync(CancellationToken cancellationToken = default);
     Task StopAsync(CancellationToken cancellationToken = default);
     void ResetHandSelection();

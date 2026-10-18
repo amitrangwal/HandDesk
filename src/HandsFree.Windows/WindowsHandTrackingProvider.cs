@@ -10,6 +10,7 @@ public sealed class WindowsHandTrackingProvider : IHandTrackingProvider
 {
     private readonly SemaphoreSlim _lifecycle = new(1, 1);
     private readonly SingleHandTrackingSelector _handSelector;
+    private readonly HandTrackingMetricAccumulator _metrics = new();
     private readonly object _selectionGate = new();
     private int _selectionGeneration;
     private CancellationTokenSource? _cancellation;
@@ -19,6 +20,7 @@ public sealed class WindowsHandTrackingProvider : IHandTrackingProvider
     private Task? _captureTask;
     private Task? _inferenceTask;
     private int _faultReported;
+    private long _nextFrameSequence;
     private bool _disposed;
 
     public WindowsHandTrackingProvider(
@@ -31,6 +33,7 @@ public sealed class WindowsHandTrackingProvider : IHandTrackingProvider
     public event Action<HandTrackingFrame>? FrameAvailable;
     public event Action<string>? StatusChanged;
     public event Action<string>? Faulted;
+    public HandTrackingMetricsSnapshot Metrics => _metrics.Snapshot();
 
     public void ResetHandSelection()
     {
@@ -51,6 +54,8 @@ public sealed class WindowsHandTrackingProvider : IHandTrackingProvider
             ObjectDisposedException.ThrowIf(_disposed, this);
             if (_capture is not null) return;
             Interlocked.Exchange(ref _faultReported, 0);
+            _metrics.Reset();
+            Interlocked.Exchange(ref _nextFrameSequence, 0);
             var modelRoot = Path.Combine(AppContext.BaseDirectory, "Models");
             var palmPath = Path.Combine(modelRoot, "PalmDetection", "palm_detection_mediapipe_2023feb.onnx");
             var handPath = Path.Combine(modelRoot, "HandPose", "handpose_estimation_mediapipe_2023feb.onnx");
@@ -98,6 +103,7 @@ public sealed class WindowsHandTrackingProvider : IHandTrackingProvider
         try
         {
             if (_capture is null && _pipeline is null) return;
+            _metrics.Reset();
             var cancellation = _cancellation;
             var frames = _frames;
             cancellation?.Cancel();
@@ -108,6 +114,8 @@ public sealed class WindowsHandTrackingProvider : IHandTrackingProvider
             try { await Task.WhenAll(tasks).WaitAsync(cancellationToken).ConfigureAwait(false); }
             catch (OperationCanceledException) when (cancellation?.IsCancellationRequested == true) { }
             catch (Exception) when (cancellation?.IsCancellationRequested == true) { }
+
+            _metrics.Reset();
 
             _capture?.Dispose();
             _pipeline?.Dispose();
@@ -168,11 +176,13 @@ public sealed class WindowsHandTrackingProvider : IHandTrackingProvider
                     for (var row = 0; row < rows; row++)
                         Marshal.Copy(image.Ptr(row), bgr, row * rowSize, rowSize);
                 }
-                writer.TryWrite(new CapturedFrame(image.Cols, image.Rows, bgr, DateTimeOffset.UtcNow));
+                var sequence = Interlocked.Increment(ref _nextFrameSequence);
+                writer.TryWrite(new CapturedFrame(image.Cols, image.Rows, bgr, DateTimeOffset.UtcNow, sequence));
             }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { }
-        catch (Exception exception) { ReportFault($"Camera capture failed: {exception.Message}"); }
+        catch (Exception exception) when (!cancellationToken.IsCancellationRequested) { ReportFault($"Camera capture failed: {exception.Message}"); }
+        catch (Exception) when (cancellationToken.IsCancellationRequested) { }
         finally { writer.TryComplete(); }
     }
 
@@ -180,10 +190,14 @@ public sealed class WindowsHandTrackingProvider : IHandTrackingProvider
     {
         try
         {
+            long lastProcessedSequence = 0;
             await foreach (var frame in reader.ReadAllAsync(cancellationToken).ConfigureAwait(false))
             {
                 var generation = Volatile.Read(ref _selectionGeneration);
-                var detections = pipeline.InferCandidates(frame.Pixels, frame.Width, frame.Height);
+                var detections = pipeline.InferCandidates(frame.Pixels, frame.Width, frame.Height, out var onnxInferenceTime);
+                var dropped = Math.Max(0, frame.Sequence - lastProcessedSequence - 1);
+                lastProcessedSequence = frame.Sequence;
+                _metrics.RecordFrame(onnxInferenceTime, frame.CapturedAt, dropped);
                 lock (_selectionGate)
                 {
                     // A reset during inference invalidates the in-flight result so it cannot
@@ -202,7 +216,8 @@ public sealed class WindowsHandTrackingProvider : IHandTrackingProvider
             }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { }
-        catch (Exception exception) { ReportFault($"Local hand inference failed: {exception.Message}"); }
+        catch (Exception exception) when (!cancellationToken.IsCancellationRequested) { ReportFault($"Local hand inference failed: {exception.Message}"); }
+        catch (Exception) when (cancellationToken.IsCancellationRequested) { }
     }
 
     private void ReportFault(string message)
@@ -213,5 +228,5 @@ public sealed class WindowsHandTrackingProvider : IHandTrackingProvider
         Faulted?.Invoke(message);
     }
 
-    private sealed record CapturedFrame(int Width, int Height, byte[] Pixels, DateTimeOffset CapturedAt);
+    private sealed record CapturedFrame(int Width, int Height, byte[] Pixels, DateTimeOffset CapturedAt, long Sequence);
 }

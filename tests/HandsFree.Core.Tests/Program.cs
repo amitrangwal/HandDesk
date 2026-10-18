@@ -1,5 +1,6 @@
 using HandsFree.Core;
 using HandsFree.Windows;
+using System.Text.Json;
 
 var tests = new (string Name, Func<Task> Run)[]
 {
@@ -16,6 +17,14 @@ var tests = new (string Name, Func<Task> Run)[]
     ("captures, clears, and scrolls a target through fake services", ScrollModeLifecycle),
     ("leaves scroll mode disabled when registration fails", ScrollModeRegistrationFailure),
     ("validates a 21-point hand result", HandTrackingResultValidation),
+    ("recognizes a conservative index-only pointer pose", IndexPointerPoseDetection),
+    ("maps pointer coordinates at movement-window edges and mirrors consistently", IndexPointerCoordinateMapping),
+    ("pauses outside the window and reanchors without a re-entry jump", IndexPointerOutOfWindowRecovery),
+    ("serializes labeled local landmark samples and validates labels", LandmarkCollectorSerializationAndLabels),
+    ("does not record fabricated samples during tracking loss", LandmarkCollectorSkipsTrackingLoss),
+    ("drains and closes the sample writer on shutdown", LandmarkCollectorWriterShutdown),
+    ("calculates bounded tracking metrics and resets session counters", TrackingMetricsCalculationAndReset),
+    ("calculates process CPU per logical core from time deltas", ProcessCpuMetricCalculation),
     ("right-hand preference acquires a confident right hand", RightHandPreferenceAcquires),
     ("left-hand detections cannot acquire a right-only lock", LeftHandCannotAcquireRightOnlyLock),
     ("left hand cannot replace the locked right hand when order changes", LeftHandCannotReplaceRightHand),
@@ -23,11 +32,13 @@ var tests = new (string Name, Func<Task> Run)[]
     ("keeps the initial hand when another hand has higher confidence", KeepsSelectedHandOverHigherConfidenceDetection),
     ("associates the same hand when detection order changes", AssociatesAcrossDetectionOrderChanges),
     ("recovers the selected hand after brief occlusion", RecoversAfterBriefOcclusion),
+    ("recovers the locked hand before the default one-second deadline", RecoversWithinDefaultRecoveryWindow),
     ("expires the identity lock after one second and searches fresh", ExpiresIdentityLockAndSearchesFresh),
     ("coordinates explicit tracking start, frame and stop using a fake provider", HandTrackingSessionLifecycle),
     ("releases resources after a provider fault", HandTrackingFaultCleanup),
     ("cleans up the provider when tracking startup fails", HandTrackingStartupFailureCleanup),
-    ("validates tensor shapes against the bundled ONNX models", InspectHandTrackingModelShapes)
+    ("validates tensor shapes against the bundled ONNX models", InspectHandTrackingModelShapes),
+    ("rejects incompatible ONNX output metadata and values", RejectsInvalidOnnxOutputContracts)
 };
 
 var failures = 0;
@@ -168,12 +179,84 @@ static Task InspectHandTrackingModelShapes()
     Assert(shapes["hand.output.Identity"].SequenceEqual([1, 63]), "Hand screen landmarks must contain 21 xyz points.");
     Assert(shapes["hand.output.Identity_1"].SequenceEqual([1, 1]) && shapes["hand.output.Identity_2"].SequenceEqual([1, 1]), "Hand presence and handedness must each be scalar outputs.");
     Assert(shapes["hand.output.Identity_3"].SequenceEqual([1, 63]), "Hand world landmarks must contain 21 xyz points.");
+    Assert(shapes.Keys.Where(key => key.StartsWith("hand.output.", StringComparison.Ordinal)).Select(key => key[12..])
+        .SequenceEqual(["Identity", "Identity_1", "Identity_2", "Identity_3"]),
+        "The bundled hand-pose output order must match the verified OpenCV Zoo semantic order.");
     using var pipeline = new OnnxHandTrackingPipeline(
         Path.Combine(modelRoot, "PalmDetection", "palm_detection_mediapipe_2023feb.onnx"),
         Path.Combine(modelRoot, "HandPose", "handpose_estimation_mediapipe_2023feb.onnx"));
     var blank = pipeline.Infer(new byte[320 * 240 * 3], 320, 240);
     Assert(!blank.IsDetected && blank.Landmarks.Count == 0, "A blank offline frame should produce a valid no-hand result.");
     return Task.CompletedTask;
+}
+
+static Task RejectsInvalidOnnxOutputContracts()
+{
+    OnnxHandTrackingPipeline.ValidateOutputNames("Hand pose inference", ["Identity_3", "Identity_2", "Identity_1", "Identity"],
+        ["Identity", "Identity_1", "Identity_2", "Identity_3"]);
+    ExpectInvalidData(() => OnnxHandTrackingPipeline.ValidateOutputNames("Hand pose inference", ["Identity", "Identity_1", "Unexpected"],
+        ["Identity", "Identity_1", "Identity_2"]), "Unexpected or missing runtime output names must be rejected.");
+
+    var expected = new Dictionary<string, int[]>(StringComparer.Ordinal)
+    {
+        ["Identity"] = [1, 2016, 18],
+        ["Identity_1"] = [1, 2016, 1]
+    };
+    OnnxHandTrackingPipeline.ValidateOutputMetadata("Palm detector", new ModelTensorMetadata[]
+    {
+        new("Identity_1", typeof(float), [1, 2016, 1]),
+        new("Identity", typeof(float), [1, 2016, 18])
+    }, expected);
+
+    ExpectInvalidData(() => OnnxHandTrackingPipeline.ValidateOutputMetadata("Palm detector", new ModelTensorMetadata[]
+    {
+        new("Identity", typeof(float), [1, 2016, 1]),
+        new("Identity_1", typeof(float), [1, 2016, 18])
+    }, expected), "Name-to-shape swaps must fail instead of binding by enumeration order.");
+    ExpectInvalidData(() => OnnxHandTrackingPipeline.ValidateOutputMetadata("Palm detector", new ModelTensorMetadata[]
+    {
+        new("Identity", typeof(double), [1, 2016, 18]),
+        new("Identity_1", typeof(float), [1, 2016, 1])
+    }, expected), "Non-float model outputs must be rejected.");
+    ExpectInvalidData(() => OnnxHandTrackingPipeline.ValidateOutputMetadata("Palm detector", new ModelTensorMetadata[]
+    {
+        new("Identity", typeof(float), [2016, 18]),
+        new("Identity_1", typeof(float), [1, 2016, 1])
+    }, expected), "An incorrect output rank must be rejected.");
+    ExpectInvalidData(() => OnnxHandTrackingPipeline.ValidateOutputMetadata("Palm detector", new ModelTensorMetadata[]
+    {
+        new("Identity", typeof(float), [1, 2016, 18]),
+        new("Unexpected", typeof(float), [1, 2016, 1])
+    }, expected), "Missing or unexpected output names must be rejected.");
+    ExpectInvalidData(() => OnnxHandTrackingPipeline.ValidateOutputMetadata("Palm detector", new ModelTensorMetadata[]
+    {
+        new("Identity", typeof(float), [1, 2016, 18]),
+        new("Identity", typeof(float), [1, 2016, 18])
+    }, expected), "Duplicate output names must be rejected.");
+
+    OnnxHandTrackingPipeline.ValidateOutputValues("Palm detector", new ModelTensorMetadata("Identity_1", typeof(float), [1, 2, 1]), [1, 2, 1], [0.1f, 0.9f]);
+    ExpectInvalidData(() => OnnxHandTrackingPipeline.ValidateOutputValues("Hand pose model", new ModelTensorMetadata("Identity", typeof(float), [1, 63]), [1, 63], new float[62]),
+        "Malformed output lengths must be rejected.");
+    ExpectInvalidData(() => OnnxHandTrackingPipeline.ValidateOutputValues("Hand pose model", new ModelTensorMetadata("Identity", typeof(float), [63]), [1, 63], new float[63]),
+        "Incorrect runtime output ranks must be rejected.");
+    var nonFiniteValues = new float[63];
+    nonFiniteValues[11] = float.NaN;
+    ExpectInvalidData(() => OnnxHandTrackingPipeline.ValidateOutputValues("Hand pose model", new ModelTensorMetadata("Identity", typeof(float), [1, 63]), [1, 63], nonFiniteValues),
+        "Non-finite landmark output values must be rejected.");
+    Assert(OnnxHandTrackingPipeline.RequireProbability(0.75f, "test score", "test") == 0.75f, "A valid classification score should be preserved.");
+    ExpectInvalidData(() => OnnxHandTrackingPipeline.RequireProbability(float.NaN, "test score", "test"), "Non-finite classification scores must be rejected.");
+    ExpectInvalidData(() => OnnxHandTrackingPipeline.RequireProbability(1.01f, "test score", "test"), "Out-of-range classification scores must be rejected.");
+    return Task.CompletedTask;
+}
+
+static void ExpectInvalidData(Action action, string failureMessage)
+{
+    try
+    {
+        action();
+        throw new InvalidOperationException(failureMessage);
+    }
+    catch (InvalidDataException) { }
 }
 
 static Task HandTrackingResultValidation()
@@ -186,6 +269,199 @@ static Task HandTrackingResultValidation()
     invalidPoints[5] = new HandLandmark(float.NaN, 0.5f, 0f);
     Assert(!HandTrackingResult.TryCreate(invalidPoints, 0.9f, 0f, out _), "Non-finite landmarks must be rejected.");
     Assert(!HandTrackingResult.TryCreate(points, 1.1f, 0f, out _), "Invalid confidence must be rejected.");
+    return Task.CompletedTask;
+}
+
+static Task IndexPointerPoseDetection()
+{
+    var valid = CreateIndexPoseHand();
+    var detected = IndexFingerPoseDetector.Detect(valid);
+    Assert(detected.IsRecognized && detected.Fingertip == new SimulatedPointerPosition(valid.Landmarks[8].X, valid.Landmarks[8].Y),
+        "A straight index with the other fingers and thumb curled should use landmark 8.");
+    Assert(IndexFingerPoseDetector.Detect(WithConfidence(valid, 0.7f)).Failure == IndexFingerPoseFailure.LowConfidence,
+        "An uncertain detection should be rejected.");
+
+    var openMiddle = valid.Landmarks.ToArray();
+    openMiddle[12] = new HandLandmark(openMiddle[10].X, 0.3f, 0);
+    openMiddle[11] = new HandLandmark(openMiddle[10].X, 0.4f, 0);
+    Assert(HandTrackingResult.TryCreate(openMiddle, 0.95f, 0.95f, out var invalid) &&
+        IndexFingerPoseDetector.Detect(invalid).Failure == IndexFingerPoseFailure.OtherFingerNotCurled,
+        "An extended middle finger should reject the index-pointer pose.");
+
+    var curledIndex = valid.Landmarks.ToArray();
+    curledIndex[8] = new HandLandmark(curledIndex[6].X, curledIndex[6].Y + 0.02f, 0);
+    Assert(HandTrackingResult.TryCreate(curledIndex, 0.95f, 0.95f, out invalid) &&
+        IndexFingerPoseDetector.Detect(invalid).Failure == IndexFingerPoseFailure.IndexNotExtended,
+        "A curled index should be rejected.");
+    return Task.CompletedTask;
+}
+
+static Task IndexPointerCoordinateMapping()
+{
+    var window = PointerMovementWindow.Default;
+    var topLeft = IndexFingerPointerMapper.TryMap(new SimulatedPointerPosition(window.Left, window.Top), window, 1280, 720);
+    var bottomRight = IndexFingerPointerMapper.TryMap(new SimulatedPointerPosition(window.Left + window.Width, window.Top + window.Height), window, 1280, 720);
+    Assert(topLeft == new SimulatedPointerPosition(0, 0), "The movement-window top-left edge should map to the desktop origin.");
+    Assert(bottomRight is { } edge && Math.Abs(edge.X - 1280) < 0.001 && Math.Abs(edge.Y - 720) < 0.001,
+        "The bottom-right edge should map to the desktop far edge.");
+    Assert(IndexFingerPointerMapper.TryMap(new SimulatedPointerPosition(window.Left - 0.001, 0.5), window, 1280, 720) is null,
+        "An out-of-window point must be rejected rather than clamped.");
+
+    const double rawX = 0.7;
+    var displayedMirrored = new SimulatedPointerPosition(1 - rawX, 0.5);
+    var mirrored = IndexFingerPointerMapper.TryMap(displayedMirrored, window, 1280, 720);
+    Assert(mirrored is { } mapped && Math.Abs(mapped.X - ((0.3 - window.Left) / window.Width * 1280)) < 0.001,
+        "Mirrored preview x should map using the displayed, mirrored coordinate.");
+    var previewMirrored = IndexFingerPointerMapper.TryMapPreviewPoint(190, 100, 50, 0, 200, 200, window, true, 1280, 720);
+    Assert(previewMirrored is { } previewMapped && Math.Abs(previewMapped.X - ((0.3 - window.Left) / window.Width * 1280)) < 0.001,
+        "Preview-coordinate mapping should apply camera-preview mirroring consistently.");
+
+    var fromSmallPreview = IndexFingerPointerMapper.TryMapPreviewPoint(150, 100, 50, 0, 200, 200, window, false, 1280, 720);
+    var fromLargePreview = IndexFingerPointerMapper.TryMapPreviewPoint(375, 250, 125, 0, 500, 500, window, false, 1280, 720);
+    Assert(fromSmallPreview == fromLargePreview, "The same normalized point must map consistently across preview sizes.");
+    Assert(IndexFingerPointerMapper.TryMapPreviewPoint(15, 100, 50, 0, 200, 200, window, false, 1280, 720) is null,
+        "Letterbox space outside the camera image must not be treated as an in-window point.");
+    return Task.CompletedTask;
+}
+
+static Task IndexPointerOutOfWindowRecovery()
+{
+    var mapper = new IndexFingerPointerMapper();
+    var window = PointerMovementWindow.Default;
+    var initial = mapper.Update(CreateIndexPoseHand(), true, window, previewMirrored: true, 1280, 720);
+    Assert(initial.PoseRecognized && initial.FingertipInsideWindow && initial.Pointer is not null, "A valid in-window pose should initialize the simulated pointer.");
+    var movedTipOut = CreateIndexPoseHand(fingertipX: 0.95f);
+    var outside = mapper.Update(movedTipOut, true, window, previewMirrored: true, 1280, 720);
+    Assert(outside.PoseRecognized && !outside.FingertipInsideWindow && outside.Pointer == initial.Pointer,
+        "Leaving the window should pause without clamping or moving the simulated pointer.");
+    var reentered = mapper.Update(CreateIndexPoseHand(), true, window, previewMirrored: true, 1280, 720);
+    Assert(reentered.FingertipInsideWindow && reentered.Pointer == initial.Pointer,
+        "Re-entry should re-anchor at the last simulated position without a jump.");
+    var next = mapper.Update(CreateIndexPoseHand(fingertipX: 0.41f), true, window, previewMirrored: true, 1280, 720);
+    Assert(next.Pointer != reentered.Pointer, "After re-anchoring, subsequent fingertip motion should move the simulated pointer.");
+
+    var lost = mapper.Update(HandTrackingResult.NoHand, false, window, previewMirrored: true, 1280, 720);
+    Assert(!lost.PoseRecognized && lost.Pointer == next.Pointer && lost.Message.Contains("paused", StringComparison.OrdinalIgnoreCase),
+        "Tracking loss should pause movement and preserve the visual marker.");
+    return Task.CompletedTask;
+}
+
+static HandTrackingResult CreateIndexPoseHand(float fingertipX = 0.39f)
+{
+    var points = new[]
+    {
+        new HandLandmark(0.50f, 0.80f, 0), // 0 wrist
+        new HandLandmark(0.47f, 0.75f, 0), new HandLandmark(0.44f, 0.70f, 0), new HandLandmark(0.42f, 0.67f, 0),
+        new HandLandmark(0.48f, 0.68f, 0), // 4 curled thumb tip
+        new HandLandmark(0.42f, 0.55f, 0), new HandLandmark(0.40f, 0.40f, 0), new HandLandmark(0.39f, 0.25f, 0),
+        new HandLandmark(fingertipX, 0.12f, 0), // 8 index tip
+        new HandLandmark(0.48f, 0.54f, 0), new HandLandmark(0.47f, 0.46f, 0), new HandLandmark(0.46f, 0.55f, 0), new HandLandmark(0.48f, 0.60f, 0),
+        new HandLandmark(0.54f, 0.55f, 0), new HandLandmark(0.55f, 0.47f, 0), new HandLandmark(0.55f, 0.56f, 0), new HandLandmark(0.56f, 0.62f, 0),
+        new HandLandmark(0.61f, 0.58f, 0), new HandLandmark(0.63f, 0.54f, 0), new HandLandmark(0.64f, 0.62f, 0), new HandLandmark(0.65f, 0.68f, 0)
+    };
+    if (!HandTrackingResult.TryCreate(points, 0.95f, 0.95f, out var result)) throw new InvalidOperationException("Invalid synthetic index pose.");
+    return result!;
+}
+
+static async Task LandmarkCollectorSerializationAndLabels()
+{
+    var directory = Path.Combine(Path.GetTempPath(), "HandsFreeTests", Guid.NewGuid().ToString("N"));
+    try
+    {
+        await using var collector = new HandLandmarkDataCollector(directory);
+        Assert(!await collector.StartAsync("  "), "Collection must reject an empty label.");
+        Assert(await collector.StartAsync("  open palm  "), "A valid gesture label should start a session.");
+        var hand = CreateHand(0.5f, 0.5f, 0.91f, 0.96f);
+        var timestamp = DateTimeOffset.UtcNow;
+        Assert(collector.TryRecord(TrackingFrame(hand, timestamp), "open palm"), "A selected hand should queue as a sample.");
+        Assert(!collector.TryRecord(TrackingFrame(hand, timestamp.AddMilliseconds(1)), "  "), "An unlabeled sample must be rejected.");
+        await collector.StopAsync();
+        var status = collector.Status;
+        Assert(status.SamplesWritten == 1 && status.State == HandLandmarkCollectionState.Stopped, "Stop should flush the accepted sample and report its count.");
+        var line = await File.ReadAllTextAsync(status.FilePath!);
+        using var json = JsonDocument.Parse(line);
+        var root = json.RootElement;
+        Assert(root.GetProperty("schemaVersion").GetInt32() == 1, "Sample schema version should be explicit.");
+        Assert(root.GetProperty("label").GetString() == "open palm", "The normalized label should be serialized.");
+        Assert(root.GetProperty("sampleId").GetInt64() == 1 && root.GetProperty("sessionId").GetGuid() == status.SessionId,
+            "Sample and collection session identifiers should be serialized.");
+        Assert(root.GetProperty("landmarks").GetArrayLength() == 21, "All 21 points should be serialized.");
+        var first = root.GetProperty("landmarks")[0];
+        Assert(first.TryGetProperty("x", out _) && first.TryGetProperty("y", out _) && first.TryGetProperty("z", out _), "Each point must preserve x/y/z.");
+        Assert(root.GetProperty("confidence").GetSingle() == hand.Confidence
+            && root.GetProperty("handednessConfidence").GetSingle() == hand.HandednessConfidence,
+            "Confidence and handedness metadata should be retained.");
+        Assert(Path.GetDirectoryName(status.FilePath) == directory, "The injected local directory should be used.");
+    }
+    finally { if (Directory.Exists(directory)) Directory.Delete(directory, true); }
+}
+
+static async Task LandmarkCollectorSkipsTrackingLoss()
+{
+    var directory = Path.Combine(Path.GetTempPath(), "HandsFreeTests", Guid.NewGuid().ToString("N"));
+    try
+    {
+        await using var collector = new HandLandmarkDataCollector(directory);
+        Assert(await collector.StartAsync("wave"), "Collection should start with a label.");
+        collector.NotifyTrackingLost("Selected hand is temporarily lost.");
+        Assert(collector.Status.Message.Contains("paused", StringComparison.OrdinalIgnoreCase), "Tracking loss should be visible in collection status.");
+        Assert(!collector.TryRecord(new HandTrackingFrame(1, 1, new byte[3], HandTrackingResult.NoHand,
+            DateTimeOffset.UtcNow, HandTrackingIdentityState.TemporarilyLost, "Selected hand is temporarily lost."), "wave"),
+            "A frame without a selected hand must not produce a sample.");
+        var hand = CreateHand(0.5f, 0.5f, 0.9f);
+        Assert(collector.TryRecord(TrackingFrame(hand, DateTimeOffset.UtcNow), "wave"), "Collection should resume when the selected hand returns.");
+        await collector.StopAsync();
+        Assert(collector.Status.SamplesWritten == 1, "Only the real detected-hand frame should be saved.");
+    }
+    finally { if (Directory.Exists(directory)) Directory.Delete(directory, true); }
+}
+
+static async Task LandmarkCollectorWriterShutdown()
+{
+    var directory = Path.Combine(Path.GetTempPath(), "HandsFreeTests", Guid.NewGuid().ToString("N"));
+    try
+    {
+        var collector = new HandLandmarkDataCollector(directory);
+        Assert(await collector.StartAsync("point"), "Collection should start.");
+        var hand = CreateHand(0.45f, 0.55f, 0.88f);
+        for (var i = 0; i < 40; i++)
+            Assert(collector.TryRecord(TrackingFrame(hand, DateTimeOffset.UtcNow.AddMilliseconds(i)), "point"), "The bounded writer should accept a normal short batch.");
+        await collector.DisposeAsync();
+        Assert(collector.Status.State == HandLandmarkCollectionState.Disposed && collector.Status.SamplesWritten == 40,
+            "Disposal should drain queued samples and release writer resources.");
+        var lines = await File.ReadAllLinesAsync(collector.Status.FilePath!);
+        Assert(lines.Length == 40, "Every accepted sample should be flushed before shutdown.");
+    }
+    finally { if (Directory.Exists(directory)) Directory.Delete(directory, true); }
+}
+
+static HandTrackingFrame TrackingFrame(HandTrackingResult result, DateTimeOffset timestamp) =>
+    new(1, 1, new byte[3], result, timestamp, HandTrackingIdentityState.Tracking, "Hand detected.");
+
+static Task TrackingMetricsCalculationAndReset()
+{
+    var metrics = new HandTrackingMetricAccumulator();
+    var start = DateTimeOffset.UnixEpoch;
+    metrics.RecordFrame(TimeSpan.FromMilliseconds(10), start, 0);
+    metrics.RecordFrame(TimeSpan.FromMilliseconds(20), start.AddMilliseconds(50), 2);
+    metrics.RecordFrame(TimeSpan.FromMilliseconds(30), start.AddMilliseconds(100), 1);
+    var snapshot = metrics.Snapshot();
+    Assert(snapshot.ProcessedFrames == 3 && snapshot.DroppedFrames == 3, "Frame and drop counts should be accumulated exactly.");
+    Assert(Math.Abs(snapshot.FramesPerSecond - 20) < 0.001, "Tracking FPS should use processed-frame timestamps.");
+    Assert(snapshot.LastOnnxLatencyMilliseconds == 30 && snapshot.AverageOnnxLatencyMilliseconds == 20 && snapshot.P95OnnxLatencyMilliseconds == 30,
+        "Last-frame latency, rolling average, and p95 should use ONNX timing samples.");
+    metrics.Reset();
+    var idle = metrics.Snapshot();
+    Assert(idle == HandTrackingMetricsSnapshot.Idle, "Reset should clear session counters and latency samples.");
+    return Task.CompletedTask;
+}
+
+static Task ProcessCpuMetricCalculation()
+{
+    Assert(Math.Abs(ProcessCpuUsage.CalculatePercent(TimeSpan.FromMilliseconds(250), TimeSpan.FromSeconds(1))!.Value - 25) < 0.001,
+        "CPU percent should be calculated from process CPU-time and wall-time deltas.");
+    Assert(ProcessCpuUsage.CalculatePercent(TimeSpan.FromSeconds(1), TimeSpan.Zero) is null,
+        "A zero elapsed interval should have no CPU percentage.");
     return Task.CompletedTask;
 }
 
@@ -272,6 +548,19 @@ static Task RecoversAfterBriefOcclusion()
     return Task.CompletedTask;
 }
 
+static Task RecoversWithinDefaultRecoveryWindow()
+{
+    var selector = new SingleHandTrackingSelector();
+    var start = DateTimeOffset.UnixEpoch;
+    var selected = CreateHand(0.42f, 0.5f, 0.9f, handedness: 0.95f);
+    selector.Update([selected], start);
+    var lost = selector.Update([], start.AddMilliseconds(100));
+    var recovered = selector.Update([WithConfidence(selected, 0.7f)], start.AddMilliseconds(999));
+    Assert(lost.State == HandTrackingIdentityState.TemporarilyLost && !lost.Result.IsDetected, "No detections should retain the lock and enter recovery.");
+    Assert(recovered.State == HandTrackingIdentityState.Tracking && recovered.Result.IsDetected, "The original hand should recover just before the default one-second expiry.");
+    return Task.CompletedTask;
+}
+
 static Task ExpiresIdentityLockAndSearchesFresh()
 {
     var selector = new SingleHandTrackingSelector();
@@ -312,8 +601,11 @@ static async Task HandTrackingSessionLifecycle()
 {
     var provider = new FakeHandTrackingProvider();
     await using var session = new HandTrackingSession(provider);
+    Assert(session.Metrics == HandTrackingMetricsSnapshot.Idle, "Tracking metrics should be idle before the session starts.");
     await session.StartAsync();
     Assert(provider.StartCount == 1 && session.Status.State == HandTrackingState.Running, "Explicit start should start the provider once.");
+    provider.Metrics = new HandTrackingMetricsSnapshot(4, 1, 30, 9, 10, 15);
+    Assert(session.Metrics.ProcessedFrames == 4, "Running sessions should expose their provider's current tracking metrics.");
     var pixels = new byte[2 * 2 * 3];
     provider.Emit(new HandTrackingFrame(2, 2, pixels, HandTrackingResult.NoHand, DateTimeOffset.UtcNow));
     Assert(session.LatestFrame?.Width == 2, "A valid latest frame should reach the shared session.");
@@ -321,8 +613,15 @@ static async Task HandTrackingSessionLifecycle()
     Assert(session.LatestFrame?.BgrPixels.Length == 12, "Malformed frame data must be ignored.");
     session.ResetHandSelection();
     Assert(provider.ResetCount == 1 && session.LatestFrame is null, "Explicit hand reset should reach the provider and clear the stale frame.");
+    provider.FrameOnStop = new HandTrackingFrame(2, 2, pixels, HandTrackingResult.NoHand, DateTimeOffset.UtcNow);
+    provider.FaultOnStop = "A shutdown-time camera callback should be ignored.";
     await session.StopAsync();
     Assert(provider.StopCount == 1 && session.LatestFrame is null && session.Status.State == HandTrackingState.Stopped, "Stop should clear frames and release the provider.");
+    Assert(session.Metrics == HandTrackingMetricsSnapshot.Idle, "Stopped sessions should expose idle tracking metrics.");
+    Assert(session.LatestFrame is null, "A final provider frame emitted during shutdown must not remain cached.");
+    await session.StartAsync();
+    Assert(session.Status.State == HandTrackingState.Running && session.LatestFrame is null && session.Metrics == HandTrackingMetricsSnapshot.Idle,
+        "Restart should begin with no stale frame or prior-session metrics.");
     await session.DisposeAsync();
     await session.DisposeAsync();
     Assert(provider.DisposeCount == 1 && session.Status.State == HandTrackingState.Disposed, "Session and provider disposal should be idempotent.");
@@ -335,6 +634,10 @@ static async Task HandTrackingStartupFailureCleanup()
     await session.StartAsync();
     Assert(session.Status.State == HandTrackingState.Faulted && session.Status.Message.Contains("Camera access was denied", StringComparison.Ordinal), "Camera permission failures should be clearly reported.");
     Assert(provider.StopCount == 1, "A failed start must ask the provider to clean up resources.");
+    provider.StartException = null;
+    await session.StartAsync();
+    Assert(session.Status.State == HandTrackingState.Running && session.LatestFrame is null && session.Metrics == HandTrackingMetricsSnapshot.Idle,
+        "A later explicit start should recover from camera startup failure with fresh session state.");
 }
 
 static async Task HandTrackingFaultCleanup()
@@ -347,6 +650,9 @@ static async Task HandTrackingFaultCleanup()
     provider.EmitFault("The camera disconnected.");
     await faulted.Task.WaitAsync(TimeSpan.FromSeconds(2));
     Assert(provider.StopCount == 1 && session.Status.Message == "The camera disconnected.", "Provider faults should stop resources and preserve a clear status.");
+    await session.StartAsync();
+    Assert(session.Status.State == HandTrackingState.Running && session.LatestFrame is null && session.Metrics == HandTrackingMetricsSnapshot.Idle,
+        "A session should recover from a provider fault with fresh frame and metric state on explicit restart.");
 }
 
 static void Assert(bool condition, string message)
@@ -431,16 +737,20 @@ sealed class FakeHandTrackingProvider : IHandTrackingProvider
     public event Action<string>? StatusChanged;
     private event Action<string>? FaultEvent;
     public event Action<string>? Faulted { add => FaultEvent += value; remove => FaultEvent -= value; }
+    public HandTrackingMetricsSnapshot Metrics { get; set; } = HandTrackingMetricsSnapshot.Idle;
     public int StartCount { get; private set; }
     public int StopCount { get; private set; }
     public int DisposeCount { get; private set; }
     public int ResetCount { get; private set; }
-    public Exception? StartException { get; init; }
+    public Exception? StartException { get; set; }
+    public HandTrackingFrame? FrameOnStop { get; set; }
+    public string? FaultOnStop { get; set; }
 
     public Task StartAsync(CancellationToken cancellationToken = default)
     {
         StartCount++;
         if (StartException is not null) throw StartException;
+        Metrics = HandTrackingMetricsSnapshot.Idle;
         StatusChanged?.Invoke("Fake camera connected.");
         return Task.CompletedTask;
     }
@@ -448,6 +758,9 @@ sealed class FakeHandTrackingProvider : IHandTrackingProvider
     public Task StopAsync(CancellationToken cancellationToken = default)
     {
         StopCount++;
+        if (FrameOnStop is { } frame) FrameAvailable?.Invoke(frame);
+        if (FaultOnStop is { } fault) FaultEvent?.Invoke(fault);
+        Metrics = HandTrackingMetricsSnapshot.Idle;
         return Task.CompletedTask;
     }
 

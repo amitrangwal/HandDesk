@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using System.Diagnostics;
 using Microsoft.ML.OnnxRuntime;
 using Microsoft.ML.OnnxRuntime.Tensors;
 using OpenCvSharp;
@@ -17,6 +18,12 @@ public sealed class OnnxHandTrackingPipeline : IDisposable
     private const float PalmScoreThreshold = 0.5f;
     private const float PalmNmsThreshold = 0.3f;
     private const float HandPresenceThreshold = 0.8f;
+    private const string PalmRegressorsOutput = "Identity";
+    private const string PalmScoresOutput = "Identity_1";
+    private const string HandScreenLandmarksOutput = "Identity";
+    private const string HandPresenceOutput = "Identity_1";
+    private const string HandednessOutput = "Identity_2";
+    private const string HandWorldLandmarksOutput = "Identity_3";
     private readonly InferenceSession _palmSession;
     private readonly InferenceSession _handSession;
     private readonly string _palmInputName;
@@ -52,18 +59,26 @@ public sealed class OnnxHandTrackingPipeline : IDisposable
             _handSession = handSession;
 
             _palmInputName = ValidateSingleInput(_palmSession, [1, PalmInputSize, PalmInputSize, 3], "palm detector");
-            _palmBoxOutputName = FindOutput(_palmSession, [1, PalmAnchorCount, PalmValuesPerAnchor], "palm boxes and landmarks");
-            _palmScoreOutputName = FindOutput(_palmSession, [1, PalmAnchorCount, 1], "palm confidence logits");
+            ValidateOutputMetadata("Palm detector", ReadOutputMetadata(_palmSession), new Dictionary<string, int[]>(StringComparer.Ordinal)
+            {
+                [PalmRegressorsOutput] = [1, PalmAnchorCount, PalmValuesPerAnchor],
+                [PalmScoresOutput] = [1, PalmAnchorCount, 1]
+            });
+            _palmBoxOutputName = PalmRegressorsOutput;
+            _palmScoreOutputName = PalmScoresOutput;
             _handInputName = ValidateSingleInput(_handSession, [1, HandInputSize, HandInputSize, 3], "hand landmark model");
-            var handLandmarkOutputs = _handSession.OutputMetadata.Where(item => ShapeMatches(item.Value.Dimensions, [1, 63])).ToArray();
-            if (handLandmarkOutputs.Length != 2)
-                throw new InvalidDataException($"Expected screen and world landmark tensors from the hand model. Actual outputs: {FormatOutputs(_handSession)}");
-            // OpenCV Zoo's reference output order is screen landmarks, confidence, handedness, world landmarks.
-            _handLandmarkOutputName = handLandmarkOutputs[0].Key;
-            var scalarOutputs = _handSession.OutputMetadata.Where(item => item.Value.Dimensions.Aggregate(1L, (size, dimension) => size * dimension) == 1).ToArray();
-            if (scalarOutputs.Length != 2) throw new InvalidDataException($"Expected confidence and handedness tensors. Actual outputs: {FormatOutputs(_handSession)}");
-            _handConfidenceOutputName = scalarOutputs[0].Key;
-            _handednessOutputName = scalarOutputs[1].Key;
+            ValidateOutputMetadata("Hand pose model", ReadOutputMetadata(_handSession), new Dictionary<string, int[]>(StringComparer.Ordinal)
+            {
+                [HandScreenLandmarksOutput] = [1, 63],
+                [HandPresenceOutput] = [1, 1],
+                [HandednessOutput] = [1, 1],
+                [HandWorldLandmarksOutput] = [1, 63]
+            });
+            // Verified OpenCV Zoo output order: screen landmarks, presence, handedness, world landmarks.
+            // Names, rather than collection ordering, bind each value below.
+            _handLandmarkOutputName = HandScreenLandmarksOutput;
+            _handConfidenceOutputName = HandPresenceOutput;
+            _handednessOutputName = HandednessOutput;
             _anchors = CreateAnchors();
         }
         catch
@@ -83,28 +98,39 @@ public sealed class OnnxHandTrackingPipeline : IDisposable
 
     /// <summary>Returns a bounded set of valid hand poses for Core identity association.</summary>
     public IReadOnlyList<Core.HandTrackingResult> InferCandidates(byte[] bgrPixels, int width, int height)
+        => InferCandidates(bgrPixels, width, height, out _);
+
+    /// <summary>Returns candidates and elapsed time spent inside the ONNX Runtime Run calls.</summary>
+    public IReadOnlyList<Core.HandTrackingResult> InferCandidates(byte[] bgrPixels, int width, int height, out TimeSpan onnxInferenceTime)
     {
+        onnxInferenceTime = TimeSpan.Zero;
         ArgumentNullException.ThrowIfNull(bgrPixels);
         if (width <= 0 || height <= 0 || bgrPixels.Length != (long)width * height * 3)
             throw new ArgumentException("The camera frame must be tightly packed BGR24 pixels.", nameof(bgrPixels));
 
         using var image = new Mat(height, width, MatType.CV_8UC3);
         Marshal.Copy(bgrPixels, 0, image.Data, bgrPixels.Length);
-        var palms = DetectPalms(image);
-        if (palms.Count == 0) return Array.Empty<Core.HandTrackingResult>();
+        long inferenceTicks = 0;
+        var palms = DetectPalms(image, ref inferenceTicks);
+        if (palms.Count == 0)
+        {
+            onnxInferenceTime = TimeSpan.FromSeconds((double)inferenceTicks / Stopwatch.Frequency);
+            return Array.Empty<Core.HandTrackingResult>();
+        }
         var results = new List<Core.HandTrackingResult>(palms.Count);
         foreach (var palm in palms)
         {
             try
             {
-                var result = DetectHand(image, palm);
+                var result = DetectHand(image, palm, ref inferenceTicks);
                 if (result.IsDetected) results.Add(result);
             }
-            catch (InvalidDataException)
+            catch (InvalidPalmCropException)
             {
                 // A geometrically invalid detector box is an unusable candidate, not a camera failure.
             }
         }
+        onnxInferenceTime = TimeSpan.FromSeconds((double)inferenceTicks / Stopwatch.Frequency);
         return results;
     }
 
@@ -126,7 +152,7 @@ public sealed class OnnxHandTrackingPipeline : IDisposable
         _handSession.Dispose();
     }
 
-    private IReadOnlyList<PalmDetection> DetectPalms(Mat bgrImage)
+    private IReadOnlyList<PalmDetection> DetectPalms(Mat bgrImage, ref long inferenceTicks)
     {
         var ratio = Math.Min((double)PalmInputSize / bgrImage.Rows, (double)PalmInputSize / bgrImage.Cols);
         var resizedWidth = (int)(bgrImage.Cols * ratio);
@@ -141,9 +167,12 @@ public sealed class OnnxHandTrackingPipeline : IDisposable
         Cv2.CvtColor(letterboxed, rgb, ColorConversionCodes.BGR2RGB);
         var input = NormalizeImage(rgb);
         var tensor = new DenseTensor<float>(input, [1, PalmInputSize, PalmInputSize, 3]);
+        var inferenceStarted = Stopwatch.GetTimestamp();
         using var output = _palmSession.Run([NamedOnnxValue.CreateFromTensor(_palmInputName, tensor)]);
-        var regressors = GetOutput(output, _palmBoxOutputName);
-        var logits = GetOutput(output, _palmScoreOutputName);
+        inferenceTicks += Stopwatch.GetTimestamp() - inferenceStarted;
+        ValidateOutputNames("Palm detector inference", output.Select(value => value.Name).ToArray(), [PalmRegressorsOutput, PalmScoresOutput]);
+        var regressors = ReadFloatOutput(output, "Palm detector", _palmBoxOutputName, [1, PalmAnchorCount, PalmValuesPerAnchor]);
+        var logits = ReadFloatOutput(output, "Palm detector", _palmScoreOutputName, [1, PalmAnchorCount, 1]);
 
         var scale = Math.Max(bgrImage.Cols, bgrImage.Rows);
         var padBiasX = (int)(left / ratio);
@@ -159,6 +188,9 @@ public sealed class OnnxHandTrackingPipeline : IDisposable
             var centerY = (regressors[offset + 1] / PalmInputSize + anchor.Y) * scale - padBiasY;
             var boxWidth = regressors[offset + 2] / PalmInputSize * scale;
             var boxHeight = regressors[offset + 3] / PalmInputSize * scale;
+            if (!float.IsFinite(centerX) || !float.IsFinite(centerY) || !float.IsFinite(boxWidth) || !float.IsFinite(boxHeight)
+                || boxWidth <= 0 || boxHeight <= 0)
+                throw new InvalidDataException($"Palm detector output '{_palmBoxOutputName}' contains invalid box coordinates or size for anchor {index}.");
             var box = new RectF(centerX - boxWidth / 2, centerY - boxHeight / 2, boxWidth, boxHeight);
             var landmarks = new Vector2[7];
             for (var landmarkIndex = 0; landmarkIndex < 7; landmarkIndex++)
@@ -167,6 +199,8 @@ public sealed class OnnxHandTrackingPipeline : IDisposable
                 landmarks[landmarkIndex] = new Vector2(
                     (regressors[landmarkOffset] / PalmInputSize + anchor.X) * scale - padBiasX,
                     (regressors[landmarkOffset + 1] / PalmInputSize + anchor.Y) * scale - padBiasY);
+                if (!float.IsFinite(landmarks[landmarkIndex].X) || !float.IsFinite(landmarks[landmarkIndex].Y))
+                    throw new InvalidDataException($"Palm detector output '{_palmBoxOutputName}' contains invalid landmark coordinates for anchor {index}.");
             }
             candidates.Add(new PalmDetection(box, landmarks, score));
         }
@@ -183,7 +217,7 @@ public sealed class OnnxHandTrackingPipeline : IDisposable
         return kept.Take(MaximumPalmCandidates).ToArray();
     }
 
-    private Core.HandTrackingResult DetectHand(Mat bgrImage, PalmDetection palm)
+    private Core.HandTrackingResult DetectHand(Mat bgrImage, PalmDetection palm, ref long inferenceTicks)
     {
         var initialBox = palm.Box;
         using var palmCrop = CropAndPad(bgrImage, initialBox, forRotation: true, out var croppedPalmBox, out var padBiasX, out var padBiasY);
@@ -209,12 +243,19 @@ public sealed class OnnxHandTrackingPipeline : IDisposable
         Cv2.CvtColor(resized, rgb, ColorConversionCodes.BGR2RGB);
         var input = NormalizeImage(rgb);
         var tensor = new DenseTensor<float>(input, [1, HandInputSize, HandInputSize, 3]);
+        var inferenceStarted = Stopwatch.GetTimestamp();
         using var output = _handSession.Run([NamedOnnxValue.CreateFromTensor(_handInputName, tensor)]);
-        var presence = GetOutput(output, _handConfidenceOutputName)[0];
+        inferenceTicks += Stopwatch.GetTimestamp() - inferenceStarted;
+        ValidateOutputNames("Hand pose inference", output.Select(value => value.Name).ToArray(),
+            [HandScreenLandmarksOutput, HandPresenceOutput, HandednessOutput, HandWorldLandmarksOutput]);
+        var screen = ReadFloatOutput(output, "Hand pose model", _handLandmarkOutputName, [1, 63]);
+        var presenceValues = ReadFloatOutput(output, "Hand pose model", _handConfidenceOutputName, [1, 1]);
+        var handednessValues = ReadFloatOutput(output, "Hand pose model", _handednessOutputName, [1, 1]);
+        _ = ReadFloatOutput(output, "Hand pose model", HandWorldLandmarksOutput, [1, 63]);
+        var presence = RequireProbability(presenceValues[0], "hand presence", _handConfidenceOutputName);
+        var modelHandedness = RequireProbability(handednessValues[0], "handedness", _handednessOutputName);
         if (presence < HandPresenceThreshold) return Core.HandTrackingResult.NoHand;
 
-        var screen = GetOutput(output, _handLandmarkOutputName);
-        var modelHandedness = Math.Clamp(GetOutput(output, _handednessOutputName)[0], 0, 1);
         // OpenCV Zoo's reference returns this bundled model output directly as 0=left, 1=right.
         // Keep inference on the unmirrored camera frame; the preview mirror is display-only.
         var handedness = modelHandedness;
@@ -255,9 +296,9 @@ public sealed class OnnxHandTrackingPipeline : IDisposable
             landmarks[index] = new Core.HandLandmark(x, y, z);
         }
 
-        return Core.HandTrackingResult.TryCreate(landmarks, Math.Clamp(presence, 0, 1), handedness, out var result)
+        return Core.HandTrackingResult.TryCreate(landmarks, presence, handedness, out var result)
             ? result!
-            : Core.HandTrackingResult.NoHand;
+            : throw new InvalidDataException($"Hand pose output '{_handLandmarkOutputName}' produced landmarks outside the supported normalized coordinate range.");
     }
 
     private static Mat CropAndPad(Mat image, RectF box, bool forRotation, out RectF resultBox, out int biasX, out int biasY)
@@ -277,7 +318,7 @@ public sealed class OnnxHandTrackingPipeline : IDisposable
         y1 = Math.Clamp((int)(centerY - halfHeight), 0, image.Rows);
         x2 = Math.Clamp((int)(centerX + halfWidth), 0, image.Cols);
         y2 = Math.Clamp((int)(centerY + halfHeight), 0, image.Rows);
-        if (x2 <= x1 || y2 <= y1) throw new InvalidDataException("The palm detector returned an invalid crop.");
+        if (x2 <= x1 || y2 <= y1) throw new InvalidPalmCropException("The palm detector returned an invalid crop.");
 
         var width = x2 - x1;
         var height = y2 - y1;
@@ -318,8 +359,83 @@ public sealed class OnnxHandTrackingPipeline : IDisposable
         return values;
     }
 
-    private static float[] GetOutput(IDisposableReadOnlyCollection<DisposableNamedOnnxValue> values, string name) =>
-        values.First(value => string.Equals(value.Name, name, StringComparison.Ordinal)).AsTensor<float>().ToArray();
+    private static float[] ReadFloatOutput(
+        IDisposableReadOnlyCollection<DisposableNamedOnnxValue> values,
+        string modelName,
+        string outputName,
+        int[] expectedDimensions)
+    {
+        var output = values.FirstOrDefault(value => string.Equals(value.Name, outputName, StringComparison.Ordinal));
+        if (output is null)
+            throw new InvalidDataException($"{modelName} inference did not return required output '{outputName}'. Check that the bundled ONNX file matches the supported model contract.");
+
+        Tensor<float> tensor;
+        try { tensor = output.AsTensor<float>(); }
+        catch (Exception exception) when (exception is InvalidCastException or InvalidOperationException)
+        {
+            throw new InvalidDataException($"{modelName} output '{outputName}' must be a float32 tensor.", exception);
+        }
+
+        var dimensions = tensor.Dimensions.ToArray();
+        var valuesArray = tensor.ToArray();
+        ValidateOutputValues(modelName, new ModelTensorMetadata(outputName, typeof(float), dimensions), expectedDimensions, valuesArray);
+        return valuesArray;
+    }
+
+    internal static void ValidateOutputMetadata(
+        string modelName,
+        IReadOnlyList<ModelTensorMetadata> actual,
+        IReadOnlyDictionary<string, int[]> expected)
+    {
+        ValidateOutputNames(modelName, actual.Select(item => item.Name).ToArray(), expected.Keys.ToArray());
+        if (actual.Count != expected.Count)
+            throw new InvalidDataException($"{modelName} has {actual.Count} output tensors; expected {expected.Count}.");
+
+        foreach (var output in actual)
+        {
+            var dimensions = expected[output.Name];
+            if (output.ElementType != typeof(float) || !output.Dimensions.SequenceEqual(dimensions))
+                throw new InvalidDataException($"{modelName} output '{output.Name}' has type {output.ElementType.Name}, rank {output.Dimensions.Count}, shape {FormatShape(output.Dimensions)}; expected float32, rank {dimensions.Length}, shape {FormatShape(dimensions)}.");
+        }
+    }
+
+    internal static void ValidateOutputNames(string modelName, IReadOnlyList<string> actual, IReadOnlyList<string> expected)
+    {
+        var actualSet = actual.ToHashSet(StringComparer.Ordinal);
+        var expectedSet = expected.ToHashSet(StringComparer.Ordinal);
+        var missing = expectedSet.Where(name => !actualSet.Contains(name)).ToArray();
+        var unexpected = actualSet.Where(name => !expectedSet.Contains(name)).ToArray();
+        var duplicates = actual.GroupBy(name => name, StringComparer.Ordinal).Where(group => group.Count() > 1).Select(group => group.Key).ToArray();
+        if (missing.Length > 0 || unexpected.Length > 0 || duplicates.Length > 0 || actual.Count != expectedSet.Count)
+            throw new InvalidDataException($"{modelName} output names are incompatible. Missing: [{string.Join(", ", missing)}]; unexpected: [{string.Join(", ", unexpected)}]; duplicates: [{string.Join(", ", duplicates)}]. Expected: [{string.Join(", ", expected)}].");
+    }
+
+    internal static void ValidateOutputValues(
+        string modelName,
+        ModelTensorMetadata actual,
+        int[] expectedDimensions,
+        IReadOnlyList<float> values)
+    {
+        if (actual.ElementType != typeof(float) || !actual.Dimensions.SequenceEqual(expectedDimensions))
+            throw new InvalidDataException($"{modelName} inference output '{actual.Name}' has type {actual.ElementType.Name}, rank {actual.Dimensions.Count}, shape {FormatShape(actual.Dimensions)}; expected float32 shape {FormatShape(expectedDimensions)}.");
+
+        var expectedLength = expectedDimensions.Aggregate(1, (length, dimension) => checked(length * dimension));
+        if (values.Count != expectedLength)
+            throw new InvalidDataException($"{modelName} inference output '{actual.Name}' contains {values.Count} values; expected {expectedLength} for shape {FormatShape(expectedDimensions)}.");
+        if (values.Any(value => !float.IsFinite(value)))
+            throw new InvalidDataException($"{modelName} inference output '{actual.Name}' contains a non-finite value.");
+    }
+
+    internal static float RequireProbability(float value, string meaning, string outputName)
+    {
+        if (!float.IsFinite(value) || value is < 0 or > 1)
+            throw new InvalidDataException($"Hand pose output '{outputName}' contains an invalid {meaning} score; expected a finite value in [0, 1].");
+        return value;
+    }
+
+    private static IReadOnlyList<ModelTensorMetadata> ReadOutputMetadata(InferenceSession session) => session.OutputMetadata
+        .Select(item => new ModelTensorMetadata(item.Key, item.Value.ElementType, item.Value.Dimensions))
+        .ToArray();
 
     private static string ValidateSingleInput(InferenceSession session, int[] expectedShape, string modelName)
     {
@@ -332,19 +448,10 @@ public sealed class OnnxHandTrackingPipeline : IDisposable
         return input.Key;
     }
 
-    private static string FindOutput(InferenceSession session, int[] expectedShape, string description)
-    {
-        var matches = session.OutputMetadata.Where(item => ShapeMatches(item.Value.Dimensions, expectedShape)).ToArray();
-        if (matches.Length != 1) throw new InvalidDataException($"Could not identify the {description} output tensor. Actual outputs: {FormatOutputs(session)}");
-        return matches[0].Key;
-    }
-
     private static bool ShapeMatches(IReadOnlyList<int> actual, IReadOnlyList<int> expected) =>
         actual.Count == expected.Count && actual.Zip(expected).All(pair => pair.First < 0 || pair.First == pair.Second);
 
     private static string FormatShape(IEnumerable<int> dimensions) => $"[{string.Join(",", dimensions)}]";
-
-    private static string FormatOutputs(InferenceSession session) => string.Join(", ", session.OutputMetadata.Select(item => $"{item.Key}:{FormatShape(item.Value.Dimensions)}"));
 
     private static float Sigmoid(float value) => value >= 0 ? 1f / (1f + MathF.Exp(-value)) : MathF.Exp(value) / (1f + MathF.Exp(value));
 
@@ -375,6 +482,8 @@ public sealed class OnnxHandTrackingPipeline : IDisposable
         }
     }
 
+    private sealed class InvalidPalmCropException(string message) : Exception(message) { }
+
     private readonly record struct PalmDetection(RectF Box, Vector2[] Landmarks, float Score);
 
     private readonly record struct Vector2(float X, float Y);
@@ -387,3 +496,5 @@ public sealed class OnnxHandTrackingPipeline : IDisposable
         public float Bottom => Y + Height;
     }
 }
+
+internal sealed record ModelTensorMetadata(string Name, Type ElementType, IReadOnlyList<int> Dimensions);
