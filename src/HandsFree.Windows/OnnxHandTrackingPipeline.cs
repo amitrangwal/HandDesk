@@ -102,8 +102,14 @@ public sealed class OnnxHandTrackingPipeline : IDisposable
 
     /// <summary>Returns candidates and elapsed time spent inside the ONNX Runtime Run calls.</summary>
     public IReadOnlyList<Core.HandTrackingResult> InferCandidates(byte[] bgrPixels, int width, int height, out TimeSpan onnxInferenceTime)
+        => InferCandidates(bgrPixels, width, height, out onnxInferenceTime, out _);
+
+    /// <summary>Returns valid poses, ONNX time, and bounded per-frame stage counts.</summary>
+    public IReadOnlyList<Core.HandTrackingResult> InferCandidates(byte[] bgrPixels, int width, int height,
+        out TimeSpan onnxInferenceTime, out Core.HandTrackingPipelineDiagnostics diagnostics)
     {
         onnxInferenceTime = TimeSpan.Zero;
+        var counters = new PipelineCounters();
         ArgumentNullException.ThrowIfNull(bgrPixels);
         if (width <= 0 || height <= 0 || bgrPixels.Length != (long)width * height * 3)
             throw new ArgumentException("The camera frame must be tightly packed BGR24 pixels.", nameof(bgrPixels));
@@ -111,10 +117,11 @@ public sealed class OnnxHandTrackingPipeline : IDisposable
         using var image = new Mat(height, width, MatType.CV_8UC3);
         Marshal.Copy(bgrPixels, 0, image.Data, bgrPixels.Length);
         long inferenceTicks = 0;
-        var palms = DetectPalms(image, ref inferenceTicks);
+        var palms = DetectPalms(image, ref inferenceTicks, ref counters);
         if (palms.Count == 0)
         {
             onnxInferenceTime = TimeSpan.FromSeconds((double)inferenceTicks / Stopwatch.Frequency);
+            diagnostics = counters.ToDiagnostics();
             return Array.Empty<Core.HandTrackingResult>();
         }
         var results = new List<Core.HandTrackingResult>(palms.Count);
@@ -122,15 +129,17 @@ public sealed class OnnxHandTrackingPipeline : IDisposable
         {
             try
             {
-                var result = DetectHand(image, palm, ref inferenceTicks);
+                var result = DetectHand(image, palm, ref inferenceTicks, ref counters);
                 if (result.IsDetected) results.Add(result);
             }
             catch (InvalidPalmCropException)
             {
                 // A geometrically invalid detector box is an unusable candidate, not a camera failure.
+                counters.InvalidCropsSkipped++;
             }
         }
         onnxInferenceTime = TimeSpan.FromSeconds((double)inferenceTicks / Stopwatch.Frequency);
+        diagnostics = counters.ToDiagnostics();
         return results;
     }
 
@@ -152,7 +161,7 @@ public sealed class OnnxHandTrackingPipeline : IDisposable
         _handSession.Dispose();
     }
 
-    private IReadOnlyList<PalmDetection> DetectPalms(Mat bgrImage, ref long inferenceTicks)
+    private IReadOnlyList<PalmDetection> DetectPalms(Mat bgrImage, ref long inferenceTicks, ref PipelineCounters counters)
     {
         var ratio = Math.Min((double)PalmInputSize / bgrImage.Rows, (double)PalmInputSize / bgrImage.Cols);
         var resizedWidth = (int)(bgrImage.Cols * ratio);
@@ -182,6 +191,7 @@ public sealed class OnnxHandTrackingPipeline : IDisposable
         {
             var score = Sigmoid(logits[index]);
             if (score < PalmScoreThreshold) continue;
+            counters.PalmCandidatesBeforeNms++;
             var offset = index * PalmValuesPerAnchor;
             var anchor = _anchors[index];
             var centerX = (regressors[offset] / PalmInputSize + anchor.X) * scale - padBiasX;
@@ -214,10 +224,13 @@ public sealed class OnnxHandTrackingPipeline : IDisposable
             if (kept.All(previous => IntersectionOverUnion(candidate.Box, previous.Box) <= PalmNmsThreshold))
                 kept.Add(candidate);
         }
-        return kept.Take(MaximumPalmCandidates).ToArray();
+        counters.PalmCandidatesAfterNms = kept.Count;
+        var limited = kept.Take(MaximumPalmCandidates).ToArray();
+        counters.PalmCandidatesAfterLimit = limited.Length;
+        return limited;
     }
 
-    private Core.HandTrackingResult DetectHand(Mat bgrImage, PalmDetection palm, ref long inferenceTicks)
+    private Core.HandTrackingResult DetectHand(Mat bgrImage, PalmDetection palm, ref long inferenceTicks, ref PipelineCounters counters)
     {
         var initialBox = palm.Box;
         using var palmCrop = CropAndPad(bgrImage, initialBox, forRotation: true, out var croppedPalmBox, out var padBiasX, out var padBiasY);
@@ -244,6 +257,7 @@ public sealed class OnnxHandTrackingPipeline : IDisposable
         var input = NormalizeImage(rgb);
         var tensor = new DenseTensor<float>(input, [1, HandInputSize, HandInputSize, 3]);
         var inferenceStarted = Stopwatch.GetTimestamp();
+        counters.HandPoseCandidatesProcessed++;
         using var output = _handSession.Run([NamedOnnxValue.CreateFromTensor(_handInputName, tensor)]);
         inferenceTicks += Stopwatch.GetTimestamp() - inferenceStarted;
         ValidateOutputNames("Hand pose inference", output.Select(value => value.Name).ToArray(),
@@ -254,7 +268,11 @@ public sealed class OnnxHandTrackingPipeline : IDisposable
         _ = ReadFloatOutput(output, "Hand pose model", HandWorldLandmarksOutput, [1, 63]);
         var presence = RequireProbability(presenceValues[0], "hand presence", _handConfidenceOutputName);
         var modelHandedness = RequireProbability(handednessValues[0], "handedness", _handednessOutputName);
-        if (presence < HandPresenceThreshold) return Core.HandTrackingResult.NoHand;
+        if (presence < HandPresenceThreshold)
+        {
+            counters.RejectedByPresenceThreshold++;
+            return Core.HandTrackingResult.NoHand;
+        }
 
         // OpenCV Zoo's reference returns this bundled model output directly as 0=left, 1=right.
         // Keep inference on the unmirrored camera frame; the preview mirror is display-only.
@@ -485,6 +503,20 @@ public sealed class OnnxHandTrackingPipeline : IDisposable
     private sealed class InvalidPalmCropException(string message) : Exception(message) { }
 
     private readonly record struct PalmDetection(RectF Box, Vector2[] Landmarks, float Score);
+
+    private struct PipelineCounters
+    {
+        public int PalmCandidatesBeforeNms;
+        public int PalmCandidatesAfterNms;
+        public int PalmCandidatesAfterLimit;
+        public int InvalidCropsSkipped;
+        public int HandPoseCandidatesProcessed;
+        public int RejectedByPresenceThreshold;
+
+        public Core.HandTrackingPipelineDiagnostics ToDiagnostics() => new(
+            PalmCandidatesBeforeNms, PalmCandidatesAfterNms, PalmCandidatesAfterLimit,
+            InvalidCropsSkipped, HandPoseCandidatesProcessed, RejectedByPresenceThreshold);
+    }
 
     private readonly record struct Vector2(float X, float Y);
 

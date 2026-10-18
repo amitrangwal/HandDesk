@@ -24,6 +24,7 @@ var tests = new (string Name, Func<Task> Run)[]
     ("does not record fabricated samples during tracking loss", LandmarkCollectorSkipsTrackingLoss),
     ("drains and closes the sample writer on shutdown", LandmarkCollectorWriterShutdown),
     ("calculates bounded tracking metrics and resets session counters", TrackingMetricsCalculationAndReset),
+    ("aggregates tracking-stage diagnostics and resets counters", TrackingDiagnosticsAggregationAndReset),
     ("calculates process CPU per logical core from time deltas", ProcessCpuMetricCalculation),
     ("right-hand preference acquires a confident right hand", RightHandPreferenceAcquires),
     ("left-hand detections cannot acquire a right-only lock", LeftHandCannotAcquireRightOnlyLock),
@@ -456,6 +457,32 @@ static Task TrackingMetricsCalculationAndReset()
     return Task.CompletedTask;
 }
 
+static Task TrackingDiagnosticsAggregationAndReset()
+{
+    var diagnostics = new HandTrackingDiagnosticsAccumulator();
+    var selector = new SingleHandTrackingSelector();
+    var right = CreateHand(0.2f, 0.5f, 0.9f, handedness: 0.95f);
+    var left = CreateHand(0.8f, 0.5f, 0.9f, handedness: 0.05f);
+    var first = selector.Update([right, left], DateTimeOffset.UnixEpoch);
+    diagnostics.RecordFrame(new HandTrackingPipelineDiagnostics(12, 5, 4, 1, 4, 1), first, true);
+    var second = selector.Update([left], DateTimeOffset.UnixEpoch.AddMilliseconds(100));
+    diagnostics.RecordFrame(new HandTrackingPipelineDiagnostics(0, 0, 0, 0, 0, 0), second, true);
+    var third = selector.Update(Array.Empty<HandTrackingResult>(), DateTimeOffset.UnixEpoch.AddSeconds(2));
+    diagnostics.RecordFrame(HandTrackingPipelineDiagnostics.Empty, third, false);
+    var snapshot = diagnostics.Snapshot();
+    Assert(snapshot.Frames == 3 && snapshot.PalmCandidatesBeforeNms == 12 && snapshot.PalmCandidatesAfterNms == 5 && snapshot.PalmCandidatesAfterLimit == 4,
+        "Palm candidate stage counts should be summed exactly.");
+    Assert(snapshot.InvalidCropsSkipped == 1 && snapshot.HandPoseCandidatesProcessed == 4 && snapshot.RejectedByPresenceThreshold == 1,
+        "Crop and pose-stage decisions should be accumulated.");
+    Assert(snapshot.RejectedByHandedness == 2 && snapshot.FramesWithSelectedHand == 1 && snapshot.FramesWithTemporarilyLostHand == 1 && snapshot.FramesWithNoCandidate == 1,
+        "Selection filters and frame outcomes should be counted.");
+    Assert(snapshot.CurrentState == HandTrackingIdentityState.Searching && snapshot.SelectedHandConfidence is null,
+        "Snapshot should expose the current lost state without stale selected confidence.");
+    diagnostics.Reset();
+    Assert(diagnostics.Snapshot() == HandTrackingDiagnosticsSnapshot.Empty, "Reset should clear totals, current state and confidence values.");
+    return Task.CompletedTask;
+}
+
 static Task ProcessCpuMetricCalculation()
 {
     Assert(Math.Abs(ProcessCpuUsage.CalculatePercent(TimeSpan.FromMilliseconds(250), TimeSpan.FromSeconds(1))!.Value - 25) < 0.001,
@@ -738,6 +765,7 @@ sealed class FakeHandTrackingProvider : IHandTrackingProvider
     private event Action<string>? FaultEvent;
     public event Action<string>? Faulted { add => FaultEvent += value; remove => FaultEvent -= value; }
     public HandTrackingMetricsSnapshot Metrics { get; set; } = HandTrackingMetricsSnapshot.Idle;
+    public HandTrackingDiagnosticsSnapshot Diagnostics { get; private set; } = HandTrackingDiagnosticsSnapshot.Empty;
     public int StartCount { get; private set; }
     public int StopCount { get; private set; }
     public int DisposeCount { get; private set; }
@@ -765,6 +793,7 @@ sealed class FakeHandTrackingProvider : IHandTrackingProvider
     }
 
     public void ResetHandSelection() => ResetCount++;
+    public void ResetDiagnostics() => Diagnostics = HandTrackingDiagnosticsSnapshot.Empty;
 
     public ValueTask DisposeAsync()
     {

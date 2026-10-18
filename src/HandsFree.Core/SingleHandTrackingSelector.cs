@@ -41,7 +41,14 @@ public sealed class SingleHandTrackingSelector
         lock (_gate)
         {
             var allValidDetections = detections.Where(item => item is { IsDetected: true, Bounds: not null }).ToArray();
-            var validDetections = allValidDetections.Where(IsPreferredHand).ToArray();
+            var validDetections = new List<HandTrackingResult>(allValidDetections.Length);
+            var rejectedHandednessCount = 0;
+            HandTrackingResult? rejectedScore = null;
+            foreach (var detection in allValidDetections)
+            {
+                if (IsPreferredHand(detection)) validDetections.Add(detection);
+                else { rejectedHandednessCount++; rejectedScore = detection; }
+            }
             var identityExpired = false;
             if (_hasLock)
             {
@@ -53,15 +60,15 @@ public sealed class SingleHandTrackingSelector
                 }
                 else
                 {
-                    var match = FindMatch(validDetections);
+                    var match = FindMatch(validDetections, out var spatiallyRejected);
                     if (match is not null)
                     {
                         Lock(match, capturedAt);
-                        return Tracking(match);
+                        return Tracking(match) with { HandednessRejectedCandidates = rejectedHandednessCount, SpatiallyRejectedCandidates = spatiallyRejected, LastRejectedHandednessScore = rejectedScore?.Handedness, LastRejectedHandednessConfidence = rejectedScore?.HandednessConfidence };
                     }
 
                     return new HandTrackingSelection(HandTrackingResult.NoHand, HandTrackingIdentityState.TemporarilyLost,
-                        NoMatchMessage(allValidDetections));
+                        NoMatchMessage(allValidDetections)) { HandednessRejectedCandidates = rejectedHandednessCount, SpatiallyRejectedCandidates = spatiallyRejected, LastRejectedHandednessScore = rejectedScore?.Handedness, LastRejectedHandednessConfidence = rejectedScore?.HandednessConfidence };
                 }
             }
 
@@ -69,13 +76,18 @@ public sealed class SingleHandTrackingSelector
             if (initial is not null)
             {
                 Lock(initial, capturedAt);
-                return Tracking(initial);
+                return Tracking(initial) with { HandednessRejectedCandidates = rejectedHandednessCount, LastRejectedHandednessScore = rejectedScore?.Handedness, LastRejectedHandednessConfidence = rejectedScore?.HandednessConfidence };
             }
 
             var message = NoCandidateMessage(allValidDetections);
             if (identityExpired)
                 message = $"Hand identity expired after {_recoveryWindow.TotalMilliseconds:0} ms without a matching hand. Searching fresh. {message}";
-            return new HandTrackingSelection(HandTrackingResult.NoHand, HandTrackingIdentityState.Searching, message);
+            return new HandTrackingSelection(HandTrackingResult.NoHand, HandTrackingIdentityState.Searching, message)
+            {
+                HandednessRejectedCandidates = rejectedHandednessCount,
+                LastRejectedHandednessScore = rejectedScore?.Handedness,
+                LastRejectedHandednessConfidence = rejectedScore?.HandednessConfidence
+            };
         }
     }
 
@@ -102,8 +114,9 @@ public sealed class SingleHandTrackingSelector
         _hasLock = false;
     }
 
-    private HandTrackingResult? FindMatch(IReadOnlyList<HandTrackingResult> detections)
+    private HandTrackingResult? FindMatch(IReadOnlyList<HandTrackingResult> detections, out int rejectedCount)
     {
+        rejectedCount = 0;
         if (_lastBounds is null) return null;
         HandTrackingResult? best = null;
         var bestScore = float.NegativeInfinity;
@@ -114,7 +127,7 @@ public sealed class SingleHandTrackingSelector
             var distanceY = bounds.CenterY - _lastBounds.CenterY;
             var centerDistance = MathF.Sqrt(distanceX * distanceX + distanceY * distanceY);
             var overlap = bounds.IntersectionOverUnion(_lastBounds);
-            if (centerDistance > MaximumCenterDistance && overlap < MinimumOverlapForMatch) continue;
+            if (centerDistance > MaximumCenterDistance && overlap < MinimumOverlapForMatch) { rejectedCount++; continue; }
 
             var positionScore = Math.Max(0, 1 - centerDistance / MaximumCenterDistance);
             var handednessSimilarity = 1 - Math.Min(1, Math.Abs(candidate.Handedness - _lastHandedness));

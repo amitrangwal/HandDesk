@@ -41,6 +41,8 @@ public sealed class MainWindow : Window
     private readonly TextBlock _inferenceMetric = new() { Text = "Inference: idle", TextWrapping = TextWrapping.Wrap };
     private readonly TextBlock _trackingRateMetric = new() { Text = "Tracking rate: idle", TextWrapping = TextWrapping.Wrap };
     private readonly TextBlock _droppedFramesMetric = new() { Text = "Dropped frames: idle", TextWrapping = TextWrapping.Wrap };
+    private readonly TextBlock _trackingDiagnostics = new() { Text = "Tracking diagnostics: waiting for data.", TextWrapping = TextWrapping.Wrap };
+    private readonly Button _resetDiagnosticsButton = new() { Content = "Reset diagnostics", MinWidth = 130 };
     private readonly TextBox _gestureLabel = new() { PlaceholderText = "Gesture label (required)", Width = 200 };
     private readonly Button _startCollectionButton = new() { Content = "Start Collection", MinWidth = 140, IsEnabled = false };
     private readonly Button _stopCollectionButton = new() { Content = "Stop Collection", MinWidth = 140, IsEnabled = false };
@@ -119,6 +121,7 @@ public sealed class MainWindow : Window
         _startTrackingButton.Click += async (_, _) => await StartTrackingAsync();
         _stopTrackingButton.Click += async (_, _) => await StopTrackingAsync();
         _resetHandSelectionButton.Click += (_, _) => ResetHandSelection();
+        _resetDiagnosticsButton.Click += (_, _) => _handTracking.ResetDiagnostics();
         _startCollectionButton.Click += async (_, _) => await StartCollectionAsync();
         _stopCollectionButton.Click += async (_, _) => await StopCollectionAsync();
         _pointerToggleButton.Click += (_, _) => TogglePointerSimulation();
@@ -191,7 +194,10 @@ public sealed class MainWindow : Window
                 _memoryMetric,
                 _inferenceMetric,
                 _trackingRateMetric,
-                _droppedFramesMetric
+                _droppedFramesMetric,
+                new TextBlock { Text = "Tracking diagnostics (session totals; reset before a test)", FontWeight = FontWeight.Medium, Margin = new Avalonia.Thickness(0, 6, 0, 0) },
+                _trackingDiagnostics,
+                _resetDiagnosticsButton
             }
         }
     };
@@ -200,6 +206,7 @@ public sealed class MainWindow : Window
 
     private void UpdateResourceMetrics()
     {
+        UpdateTrackingDiagnostics();
         try
         {
             var process = _processResourceSampler.Sample();
@@ -233,6 +240,22 @@ public sealed class MainWindow : Window
             : "ONNX inference: warming up…";
         _trackingRateMetric.Text = $"Tracking FPS: {metrics.FramesPerSecond:F1} • processed {metrics.ProcessedFrames:N0}";
         _droppedFramesMetric.Text = $"Dropped captured frames: {metrics.DroppedFrames:N0}";
+    }
+
+    private void UpdateTrackingDiagnostics()
+    {
+        var diagnostics = _handTracking.Diagnostics;
+        var selected = diagnostics.SelectedHandConfidence is { } confidence
+            ? $"selected confidence {confidence:P0}, handedness {diagnostics.SelectedHandedness:P0} (confidence {diagnostics.SelectedHandednessConfidence:P0})"
+            : diagnostics.LastRejectedHandednessScore is { } score
+                ? $"no selected hand; last rejected handedness score {score:P0} (confidence {diagnostics.LastRejectedHandednessConfidence:P0})"
+                : "no selected-hand confidence available";
+        _trackingDiagnostics.Text = $"State: {diagnostics.CurrentState} • {diagnostics.CurrentMessage}\n"
+            + $"Palm candidates: score-qualified {diagnostics.PalmCandidatesBeforeNms:N0} → after NMS {diagnostics.PalmCandidatesAfterNms:N0} → top-four {diagnostics.PalmCandidatesAfterLimit:N0}\n"
+            + $"Crops skipped: {diagnostics.InvalidCropsSkipped:N0} • pose processed: {diagnostics.HandPoseCandidatesProcessed:N0} • rejected by presence (<80%): {diagnostics.RejectedByPresenceThreshold:N0}\n"
+            + $"Rejected by handedness: {diagnostics.RejectedByHandedness:N0} • spatial association: {diagnostics.RejectedBySpatialAssociation:N0}\n"
+            + $"Frames: selected {diagnostics.FramesWithSelectedHand:N0} • no valid pose candidate {diagnostics.FramesWithNoCandidate:N0} • temporarily lost lock {diagnostics.FramesWithTemporarilyLostHand:N0}\n"
+            + selected;
     }
 
     private static double ToMiB(long bytes) => bytes / (1024d * 1024d);

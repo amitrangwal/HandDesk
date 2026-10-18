@@ -11,8 +11,10 @@ public sealed class WindowsHandTrackingProvider : IHandTrackingProvider
     private readonly SemaphoreSlim _lifecycle = new(1, 1);
     private readonly SingleHandTrackingSelector _handSelector;
     private readonly HandTrackingMetricAccumulator _metrics = new();
+    private readonly HandTrackingDiagnosticsAccumulator _diagnostics = new();
     private readonly object _selectionGate = new();
     private int _selectionGeneration;
+    private int _diagnosticsGeneration;
     private CancellationTokenSource? _cancellation;
     private Channel<CapturedFrame>? _frames;
     private VideoCapture? _capture;
@@ -34,6 +36,16 @@ public sealed class WindowsHandTrackingProvider : IHandTrackingProvider
     public event Action<string>? StatusChanged;
     public event Action<string>? Faulted;
     public HandTrackingMetricsSnapshot Metrics => _metrics.Snapshot();
+    public HandTrackingDiagnosticsSnapshot Diagnostics => _diagnostics.Snapshot();
+
+    public void ResetDiagnostics()
+    {
+        lock (_selectionGate)
+        {
+            Interlocked.Increment(ref _diagnosticsGeneration);
+            _diagnostics.Reset();
+        }
+    }
 
     public void ResetHandSelection()
     {
@@ -55,6 +67,7 @@ public sealed class WindowsHandTrackingProvider : IHandTrackingProvider
             if (_capture is not null) return;
             Interlocked.Exchange(ref _faultReported, 0);
             _metrics.Reset();
+            _diagnostics.Reset();
             Interlocked.Exchange(ref _nextFrameSequence, 0);
             var modelRoot = Path.Combine(AppContext.BaseDirectory, "Models");
             var palmPath = Path.Combine(modelRoot, "PalmDetection", "palm_detection_mediapipe_2023feb.onnx");
@@ -194,7 +207,8 @@ public sealed class WindowsHandTrackingProvider : IHandTrackingProvider
             await foreach (var frame in reader.ReadAllAsync(cancellationToken).ConfigureAwait(false))
             {
                 var generation = Volatile.Read(ref _selectionGeneration);
-                var detections = pipeline.InferCandidates(frame.Pixels, frame.Width, frame.Height, out var onnxInferenceTime);
+                var diagnosticsGeneration = Volatile.Read(ref _diagnosticsGeneration);
+                var detections = pipeline.InferCandidates(frame.Pixels, frame.Width, frame.Height, out var onnxInferenceTime, out var pipelineDiagnostics);
                 var dropped = Math.Max(0, frame.Sequence - lastProcessedSequence - 1);
                 lastProcessedSequence = frame.Sequence;
                 _metrics.RecordFrame(onnxInferenceTime, frame.CapturedAt, dropped);
@@ -204,6 +218,8 @@ public sealed class WindowsHandTrackingProvider : IHandTrackingProvider
                     // restore an old identity or overwrite the cleared session frame.
                     if (generation != _selectionGeneration) continue;
                     var selection = _handSelector.Update(detections, frame.CapturedAt);
+                    if (diagnosticsGeneration == _diagnosticsGeneration)
+                        _diagnostics.RecordFrame(pipelineDiagnostics, selection, detections.Count > 0);
                     FrameAvailable?.Invoke(new HandTrackingFrame(
                         frame.Width,
                         frame.Height,

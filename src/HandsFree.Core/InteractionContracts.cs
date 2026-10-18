@@ -130,7 +130,13 @@ public enum HandTrackingIdentityState
     LostLocked
 }
 
-public sealed record HandTrackingSelection(HandTrackingResult Result, HandTrackingIdentityState State, string Message);
+public sealed record HandTrackingSelection(HandTrackingResult Result, HandTrackingIdentityState State, string Message)
+{
+    public int HandednessRejectedCandidates { get; init; }
+    public int SpatiallyRejectedCandidates { get; init; }
+    public float? LastRejectedHandednessScore { get; init; }
+    public float? LastRejectedHandednessConfidence { get; init; }
+}
 
 public enum HandTrackingState
 {
@@ -151,6 +157,8 @@ public interface IHandTrackingProvider : IAsyncDisposable
     event Action<string>? StatusChanged;
     event Action<string>? Faulted;
     HandTrackingMetricsSnapshot Metrics { get; }
+    HandTrackingDiagnosticsSnapshot Diagnostics { get; }
+    void ResetDiagnostics();
     Task StartAsync(CancellationToken cancellationToken = default);
     Task StopAsync(CancellationToken cancellationToken = default);
     void ResetHandSelection();

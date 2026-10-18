@@ -31,6 +31,13 @@ public sealed class HandTrackingSession : IAsyncDisposable
         ? _provider.Metrics
         : HandTrackingMetricsSnapshot.Idle;
 
+    public HandTrackingDiagnosticsSnapshot Diagnostics => _provider.Diagnostics;
+
+    public void ResetDiagnostics()
+    {
+        if (!_disposed) _provider.ResetDiagnostics();
+    }
+
     /// <summary>Explicitly releases the current identity lock so the next candidate can be selected.</summary>
     public void ResetHandSelection()
     {
