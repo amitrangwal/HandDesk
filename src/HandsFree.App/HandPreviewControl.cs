@@ -23,6 +23,8 @@ internal sealed class HandPreviewControl : Control, IDisposable
     private byte[] _convertedBuffer = [];
     private IReadOnlyList<HandLandmark> _landmarks = Array.Empty<HandLandmark>();
     private PointerMovementWindow _movementWindow = PointerMovementWindow.Default;
+    private bool _mirror = true;
+    private bool _showMovementWindow = true;
 
     public HandPreviewControl()
     {
@@ -31,38 +33,46 @@ internal sealed class HandPreviewControl : Control, IDisposable
 
     public void UpdateFrame(HandTrackingFrame frame)
     {
-        if (_bitmap is null || _bitmap.PixelSize.Width != frame.Width || _bitmap.PixelSize.Height != frame.Height)
+        UpdateImage(frame.Width, frame.Height, frame.BgrPixels, frame.Result.IsDetected ? frame.Result.Landmarks : Array.Empty<HandLandmark>(), true);
+    }
+
+    public void UpdateImage(int width, int height, ReadOnlyMemory<byte> bgrPixels, IReadOnlyList<HandLandmark>? landmarks = null, bool mirror = true, bool showMovementWindow = true)
+    {
+        if (width <= 0 || height <= 0 || bgrPixels.Length != (long)width * height * 3) return;
+        if (_bitmap is null || _bitmap.PixelSize.Width != width || _bitmap.PixelSize.Height != height)
         {
             _bitmap?.Dispose();
-            _bitmap = new WriteableBitmap(new PixelSize(frame.Width, frame.Height), new Vector(96, 96), PixelFormat.Bgra8888, AlphaFormat.Opaque);
+            _bitmap = new WriteableBitmap(new PixelSize(width, height), new Vector(96, 96), PixelFormat.Bgra8888, AlphaFormat.Opaque);
         }
 
         using (var buffer = _bitmap.Lock())
         {
-            var source = frame.BgrPixels.Span;
-            if (_convertedBuffer.Length != checked(frame.Width * frame.Height * 4))
-                _convertedBuffer = new byte[frame.Width * frame.Height * 4];
+            var source = bgrPixels.Span;
+            if (_convertedBuffer.Length != checked(width * height * 4))
+                _convertedBuffer = new byte[width * height * 4];
             for (var sourceIndex = 0; sourceIndex < source.Length; sourceIndex += 3)
             {
                 var sourcePixel = sourceIndex / 3;
-                var x = sourcePixel % frame.Width;
-                var y = sourcePixel / frame.Width;
-                var mirroredPixel = y * frame.Width + (frame.Width - 1 - x);
-                var outputIndex = mirroredPixel * 4;
+                var x = sourcePixel % width;
+                var y = sourcePixel / width;
+                var outputPixel = y * width + (mirror ? width - 1 - x : x);
+                var outputIndex = outputPixel * 4;
                 _convertedBuffer[outputIndex] = source[sourceIndex + 2];
                 _convertedBuffer[outputIndex + 1] = source[sourceIndex + 1];
                 _convertedBuffer[outputIndex + 2] = source[sourceIndex];
                 _convertedBuffer[outputIndex + 3] = 255;
             }
 
-            var rowBytes = frame.Width * 4;
+            var rowBytes = width * 4;
             if (buffer.RowBytes == rowBytes) Marshal.Copy(_convertedBuffer, 0, buffer.Address, _convertedBuffer.Length);
             else
-                for (var row = 0; row < frame.Height; row++)
+                for (var row = 0; row < height; row++)
                     Marshal.Copy(_convertedBuffer, row * rowBytes, buffer.Address + row * buffer.RowBytes, rowBytes);
         }
 
-        _landmarks = frame.Result.IsDetected ? frame.Result.Landmarks : Array.Empty<HandLandmark>();
+        _landmarks = landmarks?.Count == 21 ? landmarks : Array.Empty<HandLandmark>();
+        _mirror = mirror;
+        _showMovementWindow = showMovementWindow;
         InvalidateVisual();
     }
 
@@ -99,7 +109,7 @@ internal sealed class HandPreviewControl : Control, IDisposable
         var top = (Bounds.Height - height) / 2;
         var imageRect = new Rect(left, top, width, height);
         context.DrawImage(_bitmap, new Rect(0, 0, imageWidth, imageHeight), imageRect);
-        if (_movementWindow.IsValid)
+        if (_showMovementWindow && _movementWindow.IsValid)
         {
             var area = new Rect(left + _movementWindow.Left * width, top + _movementWindow.Top * height,
                 _movementWindow.Width * width, _movementWindow.Height * height);
@@ -108,12 +118,12 @@ internal sealed class HandPreviewControl : Control, IDisposable
         }
         if (_landmarks.Count != 21) return;
 
-        Point At(int index) => new(left + (1 - _landmarks[index].X) * width, top + _landmarks[index].Y * height);
+        Point At(int index) => new(left + (_mirror ? 1 - _landmarks[index].X : _landmarks[index].X) * width, top + _landmarks[index].Y * height);
         var bonePen = new Pen(Brushes.Lime, 2);
         foreach (var (a, b) in Connections) context.DrawLine(bonePen, At(a), At(b));
         foreach (var landmark in _landmarks)
         {
-            var point = new Point(left + (1 - landmark.X) * width, top + landmark.Y * height);
+            var point = new Point(left + (_mirror ? 1 - landmark.X : landmark.X) * width, top + landmark.Y * height);
             context.DrawEllipse(Brushes.Yellow, new Pen(Brushes.Black, 1), point, 3.5, 3.5);
         }
     }

@@ -17,9 +17,9 @@
   </ItemGroup>
   <Target Name="TrimUnusedHandTrackingPublishFiles" BeforeTargets="ComputeFilesToPublish">
     <ItemGroup>
-      <!-- The provider explicitly selects Media Foundation, so OpenCV's optional FFmpeg backend is unused. -->
+      <!-- Gesture Studio uses OpenCV's FFmpeg video I/O plugin for local MP4 sample recording and review. -->
       <ResolvedFileToPublish Remove="@(ResolvedFileToPublish)"
-          Condition="$([System.String]::Copy('%(Filename)').StartsWith('opencv_videoio_ffmpeg')) Or '%(Extension)' == '.pdb'" />
+          Condition="'%(Extension)' == '.pdb'" />
     </ItemGroup>
   </Target>
 </Project>

@@ -23,6 +23,8 @@ var tests = new (string Name, Func<Task> Run)[]
     ("serializes labeled local landmark samples and validates labels", LandmarkCollectorSerializationAndLabels),
     ("does not record fabricated samples during tracking loss", LandmarkCollectorSkipsTrackingLoss),
     ("drains and closes the sample writer on shutdown", LandmarkCollectorWriterShutdown),
+    ("serializes synchronized Gesture Studio rows and represents tracking loss explicitly", GestureStudioFrameRecordSerialization),
+    ("finalizes a local Gesture Studio video and landmark sample", GestureStudioStoreRecording),
     ("calculates bounded tracking metrics and resets session counters", TrackingMetricsCalculationAndReset),
     ("aggregates tracking-stage diagnostics and resets counters", TrackingDiagnosticsAggregationAndReset),
     ("calculates process CPU per logical core from time deltas", ProcessCpuMetricCalculation),
@@ -436,6 +438,72 @@ static async Task LandmarkCollectorWriterShutdown()
     finally { if (Directory.Exists(directory)) Directory.Delete(directory, true); }
 }
 
+static Task GestureStudioFrameRecordSerialization()
+{
+    var sessionId = Guid.NewGuid();
+    var sampleId = Guid.NewGuid();
+    var start = DateTimeOffset.UnixEpoch;
+    var detectedAt = start.AddMilliseconds(125);
+    var selected = TrackingFrame(CreateHand(0.45f, 0.55f, 0.92f), detectedAt);
+    var selectedRow = GestureStudioFrameRecord.FromFrame(sessionId, sampleId, 3, start, selected);
+    var roundTrip = GestureStudioFrameRecord.ParseJsonLine(selectedRow.ToJsonLine());
+    Assert(roundTrip.SchemaVersion == 1 && roundTrip.VideoFrameIndex == 3 && roundTrip.ElapsedMilliseconds == 125,
+        "Rows should use schema version 1 and map frame index to a timestamp.");
+    Assert(roundTrip.Landmarks?.Count == 21 && roundTrip.Confidence == selected.Result.Confidence && roundTrip.Handedness == selected.Result.Handedness,
+        "Selected-hand landmarks and classification metadata should be retained.");
+
+    var lostFrame = new HandTrackingFrame(1, 1, new byte[3], HandTrackingResult.NoHand, start.AddMilliseconds(160),
+        HandTrackingIdentityState.TemporarilyLost, "Selected hand is temporarily lost.");
+    var lost = GestureStudioFrameRecord.ParseJsonLine(GestureStudioFrameRecord.FromFrame(sessionId, sampleId, 4, start, lostFrame).ToJsonLine());
+    Assert(!lost.IsDetected && lost.Landmarks is null && lost.MissingReason == lostFrame.TrackingMessage,
+        "A video frame without a selected hand must contain an explicit null landmark value and reason.");
+    return Task.CompletedTask;
+}
+
+static async Task GestureStudioStoreRecording()
+{
+    var directory = Path.Combine(Path.GetTempPath(), "HandsFreeGestureStudioTests", Guid.NewGuid().ToString("N"));
+    try
+    {
+        await using var store = new GestureStudioStore(directory);
+        var sessionId = Guid.NewGuid();
+        Assert(!await store.StartSampleAsync(sessionId, " ", null, 64, 48), "An unlabeled sample must not start.");
+        Assert(await store.StartSampleAsync(sessionId, "wave", "test note", 64, 48), "A labeled local recording should start.");
+        for (var i = 0; i < 12; i++)
+        {
+            var pixels = new byte[64 * 48 * 3];
+            Array.Fill(pixels, (byte)(i * 12));
+            var frame = new HandTrackingFrame(64, 48, pixels, HandTrackingResult.NoHand,
+                DateTimeOffset.UnixEpoch.AddMilliseconds(i * 33), HandTrackingIdentityState.Searching, "No selected hand.");
+            Assert(store.TryWriteFrame(frame), "A small test frame should enter the bounded recording queue.");
+            await Task.Delay(15);
+        }
+        await store.StopSampleAsync();
+        var status = store.Status;
+        Assert(status.State == GestureStudioRecordingState.Idle && status.FramesWritten == 12, "Stop should drain and finalize every accepted test frame.");
+        var sample = store.ListSamples().Single();
+        Assert(File.Exists(Path.Combine(sample.Directory, sample.Manifest.VideoFile)), "The original video should be retained.");
+        Assert(sample.Manifest.SchemaVersion == 1 && sample.Manifest.Label == "wave" && sample.Manifest.Notes == "test note",
+            "The versioned manifest should preserve session setup metadata.");
+        var lines = await File.ReadAllLinesAsync(Path.Combine(sample.Directory, sample.Manifest.LandmarksFile));
+        Assert(lines.Length == 12 && GestureStudioFrameRecord.ParseJsonLine(lines[0]).Landmarks is null,
+            "Video frames without a hand should each have an explicit JSONL loss row.");
+        using (var reader = new GestureStudioVideoReader(Path.Combine(sample.Directory, sample.Manifest.VideoFile)))
+            Assert(reader.FrameCount == 12 && reader.TryReadFrame(0, out _), "The recorded MP4 should be reviewable without camera hardware.");
+        var trimmed = await store.ExportTrimAsync(sample.Directory, 0.1, 0.3);
+        var trimmedRows = await File.ReadAllLinesAsync(trimmed.LandmarksPath);
+        Assert(trimmedRows.Length == 6 && GestureStudioFrameRecord.ParseJsonLine(trimmedRows[0]).VideoFrameIndex == 0,
+            "Trimmed landmark rows should use the same selected interval and remap frame indices from zero.");
+        using (var trimmedReader = new GestureStudioVideoReader(trimmed.VideoPath))
+            Assert(trimmedReader.FrameCount == 6, "Trimmed video and JSONL should contain the same CFR frame count.");
+        await store.UpdateSampleAsync(sample.Directory, "reviewed wave", "keep", discard: true);
+        Assert(File.Exists(Path.Combine(sample.Directory, sample.Manifest.VideoFile))
+            && store.ListSamples().Single().Manifest.Disposition == "Discarded",
+            "Marking a sample discarded should update metadata and preserve the original video.");
+    }
+    finally { if (Directory.Exists(directory)) Directory.Delete(directory, true); }
+}
+
 static HandTrackingFrame TrackingFrame(HandTrackingResult result, DateTimeOffset timestamp) =>
     new(1, 1, new byte[3], result, timestamp, HandTrackingIdentityState.Tracking, "Hand detected.");
 
@@ -631,11 +699,14 @@ static async Task HandTrackingSessionLifecycle()
     Assert(session.Metrics == HandTrackingMetricsSnapshot.Idle, "Tracking metrics should be idle before the session starts.");
     await session.StartAsync();
     Assert(provider.StartCount == 1 && session.Status.State == HandTrackingState.Running, "Explicit start should start the provider once.");
+    var sharedFrameCount = 0;
+    session.FrameAvailable += _ => sharedFrameCount++;
     provider.Metrics = new HandTrackingMetricsSnapshot(4, 1, 30, 9, 10, 15);
     Assert(session.Metrics.ProcessedFrames == 4, "Running sessions should expose their provider's current tracking metrics.");
     var pixels = new byte[2 * 2 * 3];
     provider.Emit(new HandTrackingFrame(2, 2, pixels, HandTrackingResult.NoHand, DateTimeOffset.UtcNow));
     Assert(session.LatestFrame?.Width == 2, "A valid latest frame should reach the shared session.");
+    Assert(sharedFrameCount == 1, "The same validated tracking frame should be available to auxiliary consumers.");
     provider.Emit(new HandTrackingFrame(2, 2, new byte[3], HandTrackingResult.NoHand, DateTimeOffset.UtcNow));
     Assert(session.LatestFrame?.BgrPixels.Length == 12, "Malformed frame data must be ignored.");
     session.ResetHandSelection();

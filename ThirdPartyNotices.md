@@ -19,4 +19,6 @@ The full Apache 2.0 text is in `src/HandsFree.Windows/Models/PalmDetection/LICEN
 - `OpenCvSharp4` 4.13.0.20260627 — managed OpenCV bindings, Apache-2.0: [repository and license](https://github.com/shimat/opencvsharp).
 - `OpenCvSharp4.runtime.win` 4.13.0.20260627 — Windows native OpenCV runtime components, Apache-2.0: [package](https://www.nuget.org/packages/OpenCvSharp4.runtime.win/).
 
+Gesture Studio uses the `opencv_videoio_ffmpeg4130_64.dll` optional video I/O plugin from that same OpenCvSharp Windows runtime package for MP4 encoding/decoding. The application now retains that plugin in publish output; review the package's bundled notices and FFmpeg build/license details when redistributing the packaged application.
+
 These NuGet packages are restored by the .NET SDK and are not downloaded at camera start. Consult the linked upstream package and repository notices when redistributing builds.

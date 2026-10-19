@@ -20,6 +20,9 @@ public sealed class HandTrackingSession : IAsyncDisposable
 
     public event Action<HandTrackingStatus>? StatusChanged;
 
+    /// <summary>Raised on the provider inference thread for each validated frame. Subscribers must enqueue quickly.</summary>
+    public event Action<HandTrackingFrame>? FrameAvailable;
+
     public HandTrackingStatus Status
     {
         get { lock (_stateGate) return _status; }
@@ -136,6 +139,14 @@ public sealed class HandTrackingSession : IAsyncDisposable
         {
             if (_disposed || _status.State is not (HandTrackingState.Starting or HandTrackingState.Running)) return;
             Volatile.Write(ref _latestFrame, frame);
+        }
+
+        var subscribers = FrameAvailable;
+        if (subscribers is null) return;
+        foreach (Action<HandTrackingFrame> subscriber in subscribers.GetInvocationList())
+        {
+            try { subscriber(frame); }
+            catch { /* A recording or preview subscriber must not fault the inference loop. */ }
         }
     }
 

@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.ComponentModel;
 using Avalonia.Controls;
 using Avalonia.Layout;
 using Avalonia.Media;
@@ -22,46 +23,54 @@ public sealed class MainWindow : Window
     private readonly DispatcherTimer _previewTimer = new() { Interval = TimeSpan.FromMilliseconds(33) };
     private readonly DispatcherTimer _resourceTimer = new() { Interval = TimeSpan.FromSeconds(1) };
     private readonly WindowsProcessResourceSampler _processResourceSampler = new();
-    private readonly HandPreviewControl _handPreview = new() { Height = 300, MinHeight = 220 };
-    private readonly SimulatedDesktopControl _simulatedDesktop = new() { Height = 220, MinHeight = 170 };
+    private readonly HandPreviewControl _handPreview = new() { Height = 300, MinHeight = 200, MaxHeight = 360 };
+    private Grid? _cameraResourceGrid;
+    private Border? _resourceMonitorPanel;
+    private bool? _cameraResourceStacked;
+    private readonly SimulatedDesktopControl _simulatedDesktop = new() { Height = 170, MinHeight = 130 };
     private readonly TextBlock _pointerStatus = new() { Text = "Pointer simulation is disabled.", TextWrapping = TextWrapping.Wrap };
-    private readonly Button _pointerToggleButton = new() { Content = "Enable pointer simulation", MinWidth = 190, IsEnabled = false };
-    private readonly Slider _windowLeft = new() { Minimum = 0, Maximum = 1, Value = 0.2, Width = 220 };
-    private readonly Slider _windowTop = new() { Minimum = 0, Maximum = 1, Value = 0.1, Width = 220 };
-    private readonly Slider _windowWidth = new() { Minimum = 0.1, Maximum = 1, Value = 0.6, Width = 220 };
-    private readonly Slider _windowHeight = new() { Minimum = 0.1, Maximum = 1, Value = 0.8, Width = 220 };
+    private readonly Button _pointerToggleButton = new() { Content = "Enable pointer simulation", MinWidth = 150, MinHeight = 32, Margin = new Avalonia.Thickness(0, 0, 6, 4), IsEnabled = false };
+    private readonly Slider _windowLeft = new() { Minimum = 0, Maximum = 1, Value = 0.2, Width = 180 };
+    private readonly Slider _windowTop = new() { Minimum = 0, Maximum = 1, Value = 0.1, Width = 180 };
+    private readonly Slider _windowWidth = new() { Minimum = 0.1, Maximum = 1, Value = 0.6, Width = 180 };
+    private readonly Slider _windowHeight = new() { Minimum = 0.1, Maximum = 1, Value = 0.8, Width = 180 };
     private bool _updatingWindowControls;
     private bool _pointerSimulationEnabled;
-    private readonly Button _startTrackingButton = new() { Content = "Start Tracking", MinWidth = 130 };
-    private readonly Button _stopTrackingButton = new() { Content = "Stop Tracking", MinWidth = 130, IsEnabled = false };
-    private readonly Button _resetHandSelectionButton = new() { Content = "Reset Hand Lock", MinWidth = 130, IsEnabled = false };
+    private readonly Button _startTrackingButton = new() { Content = "Start Tracking", MinWidth = 105, MinHeight = 32, Margin = new Avalonia.Thickness(0, 0, 6, 3) };
+    private readonly Button _stopTrackingButton = new() { Content = "Stop Tracking", MinWidth = 95, MinHeight = 32, Margin = new Avalonia.Thickness(0, 0, 6, 3), IsEnabled = false };
+    private readonly Button _resetHandSelectionButton = new() { Content = "Reset Hand Lock", MinWidth = 110, MinHeight = 32, Margin = new Avalonia.Thickness(0, 0, 6, 3), IsEnabled = false };
     private readonly TextBlock _trackingStatus = new() { Text = "Tracking is stopped.", TextWrapping = TextWrapping.Wrap };
-    private readonly TextBlock _processCpuMetric = new() { Text = "Process CPU: sampling…", TextWrapping = TextWrapping.Wrap };
-    private readonly TextBlock _memoryMetric = new() { Text = "Memory: sampling…", TextWrapping = TextWrapping.Wrap };
-    private readonly TextBlock _inferenceMetric = new() { Text = "Inference: idle", TextWrapping = TextWrapping.Wrap };
-    private readonly TextBlock _trackingRateMetric = new() { Text = "Tracking rate: idle", TextWrapping = TextWrapping.Wrap };
-    private readonly TextBlock _droppedFramesMetric = new() { Text = "Dropped frames: idle", TextWrapping = TextWrapping.Wrap };
+    private readonly TextBlock _processCpuMetric = new() { Text = "Process CPU: sampling…", TextWrapping = TextWrapping.Wrap, Margin = new Avalonia.Thickness(0, 0, 8, 4) };
+    private readonly TextBlock _memoryMetric = new() { Text = "Memory: sampling…", TextWrapping = TextWrapping.Wrap, Margin = new Avalonia.Thickness(0, 0, 8, 4) };
+    private readonly TextBlock _inferenceMetric = new() { Text = "Inference: idle", TextWrapping = TextWrapping.Wrap, Margin = new Avalonia.Thickness(0, 0, 8, 4) };
+    private readonly TextBlock _trackingRateMetric = new() { Text = "Tracking rate: idle", TextWrapping = TextWrapping.Wrap, Margin = new Avalonia.Thickness(0, 0, 8, 4) };
+    private readonly TextBlock _droppedFramesMetric = new() { Text = "Dropped frames: idle", TextWrapping = TextWrapping.Wrap, Margin = new Avalonia.Thickness(0, 0, 8, 4) };
+    private readonly TextBlock _trackingDiagnosticsSummary = new() { Text = "Tracking diagnostics: waiting for data.", TextWrapping = TextWrapping.Wrap };
     private readonly TextBlock _trackingDiagnostics = new() { Text = "Tracking diagnostics: waiting for data.", TextWrapping = TextWrapping.Wrap };
-    private readonly Button _resetDiagnosticsButton = new() { Content = "Reset diagnostics", MinWidth = 130 };
-    private readonly TextBox _gestureLabel = new() { PlaceholderText = "Gesture label (required)", Width = 200 };
-    private readonly Button _startCollectionButton = new() { Content = "Start Collection", MinWidth = 140, IsEnabled = false };
-    private readonly Button _stopCollectionButton = new() { Content = "Stop Collection", MinWidth = 140, IsEnabled = false };
+    private readonly Button _resetDiagnosticsButton = new() { Content = "Reset diagnostics", MinWidth = 110, MinHeight = 30, Margin = new Avalonia.Thickness(0, 2, 6, 0) };
+    private readonly TextBox _gestureLabel = new() { PlaceholderText = "Gesture label (required)", Width = 180, Height = 32, Margin = new Avalonia.Thickness(0, 0, 6, 4) };
+    private readonly Button _startCollectionButton = new() { Content = "Start Collection", MinWidth = 110, MinHeight = 30, Margin = new Avalonia.Thickness(0, 0, 6, 4), IsEnabled = false };
+    private readonly Button _stopCollectionButton = new() { Content = "Stop Collection", MinWidth = 100, MinHeight = 30, Margin = new Avalonia.Thickness(0, 0, 6, 4), IsEnabled = false };
     private readonly TextBlock _collectionStatus = new() { Text = "Collection is stopped.", TextWrapping = TextWrapping.Wrap };
     private DateTimeOffset _lastPreviewTimestamp;
-    private readonly TextBox _executablePath = new() { PlaceholderText = "Full path to an .exe", Width = 360 };
-    private readonly TextBox _xCoordinate = new() { Text = "640", Width = 90 };
-    private readonly TextBox _yCoordinate = new() { Text = "360", Width = 90 };
+    private readonly TextBox _executablePath = new() { PlaceholderText = "Full path to an .exe", Width = 280, Height = 32, Margin = new Avalonia.Thickness(0, 0, 6, 4) };
+    private readonly TextBox _xCoordinate = new() { Text = "640", Width = 70, Height = 32, Margin = new Avalonia.Thickness(0, 0, 5, 4) };
+    private readonly TextBox _yCoordinate = new() { Text = "360", Width = 70, Height = 32, Margin = new Avalonia.Thickness(0, 0, 6, 4) };
     private readonly TextBlock _status = new() { TextWrapping = TextWrapping.Wrap };
-    private readonly TextBox _captureShortcut = new() { Text = "Ctrl+Alt+F9", Width = 145 };
-    private readonly TextBox _scrollDownShortcut = new() { Text = "Ctrl+Alt+F10", Width = 145 };
-    private readonly TextBox _scrollUpShortcut = new() { Text = "Ctrl+Alt+F11", Width = 145 };
+    private readonly TextBox _captureShortcut = new() { Text = "Ctrl+Alt+F9", Width = 120, Height = 32, Margin = new Avalonia.Thickness(4, 0, 8, 4) };
+    private readonly TextBox _scrollDownShortcut = new() { Text = "Ctrl+Alt+F10", Width = 120, Height = 32, Margin = new Avalonia.Thickness(4, 0, 8, 4) };
+    private readonly TextBox _scrollUpShortcut = new() { Text = "Ctrl+Alt+F11", Width = 120, Height = 32, Margin = new Avalonia.Thickness(4, 0, 8, 4) };
     private readonly TextBlock _scrollModeStatus = new() { Text = "Scroll test mode: Disabled" };
-    private readonly Button _scrollModeButton = new() { Content = "Enable scroll test mode", MinWidth = 190 };
-    private readonly Button _captureTargetButton = new() { Content = "Capture Target Window", MinWidth = 190 };
-    private readonly Button _clearTargetButton = new() { Content = "Clear Target", MinWidth = 110, IsEnabled = false };
+    private readonly Button _scrollModeButton = new() { Content = "Enable scroll test mode", MinWidth = 150, MinHeight = 32, Margin = new Avalonia.Thickness(0, 0, 6, 4) };
+    private readonly Button _captureTargetButton = new() { Content = "Capture Target Window", MinWidth = 160, MinHeight = 32, Margin = new Avalonia.Thickness(0, 0, 6, 4) };
+    private readonly Button _clearTargetButton = new() { Content = "Clear Target", MinWidth = 95, MinHeight = 32, Margin = new Avalonia.Thickness(0, 0, 6, 4), IsEnabled = false };
     private readonly TextBlock _targetStatus = new() { Text = "Target: None captured", TextWrapping = TextWrapping.Wrap };
-    private readonly Button _themeToggleButton = new() { Content = "Switch to dark theme", MinWidth = 160 };
+    private readonly Button _themeToggleButton = new() { Content = "Switch to dark theme", MinWidth = 145, MinHeight = 32 };
     private bool _darkTheme;
+    private readonly Button _gestureStudioButton = new() { Content = "Gesture Studio", MinWidth = 112, MinHeight = 32 };
+    private GestureStudioWindow? _gestureStudioWindow;
+    private bool _mainCloseInProgress;
+    private bool _allowMainClose;
 
     public MainWindow()
     {
@@ -74,7 +83,7 @@ public sealed class MainWindow : Window
         _previewTimer.Tick += OnPreviewTimerTick;
         _resourceTimer.Tick += OnResourceTimerTick;
         Title = "HandsFree";
-        Width = 720;
+        Width = 1040;
         Height = 720;
         MinWidth = 520;
         MinHeight = 420;
@@ -82,23 +91,18 @@ public sealed class MainWindow : Window
 
         var controls = new StackPanel
         {
-            Margin = new Avalonia.Thickness(32),
-            Spacing = 16,
+            Margin = new Avalonia.Thickness(18),
+            Spacing = 10,
             Children =
             {
-                new StackPanel { Orientation = Orientation.Horizontal, Spacing = 12, Children = { new TextBlock { Text = "HandsFree", FontSize = 32, FontWeight = FontWeight.SemiBold, VerticalAlignment = VerticalAlignment.Center }, _themeToggleButton } },
-                new TextBlock { Text = "A local-first foundation for hands-free interaction.", FontSize = 16 },
+                new WrapPanel { Orientation = Orientation.Horizontal, Children = { new TextBlock { Text = "HandsFree", FontSize = 27, FontWeight = FontWeight.SemiBold, VerticalAlignment = VerticalAlignment.Center, Margin = new Avalonia.Thickness(0, 0, 14, 0) }, _themeToggleButton, _gestureStudioButton } },
+                new TextBlock { Text = "A local-first workspace for hands-free interaction.", FontSize = 14 },
                 HandTrackingControls(),
-                ResourceMonitorControls(),
-                new TextBlock { Text = "Manual Windows control test", FontSize = 20, FontWeight = FontWeight.Medium },
-                new TextBlock { Text = "Each button performs one explicit action. Nothing runs automatically.", TextWrapping = TextWrapping.Wrap },
-                LaunchRow(),
-                CoordinateRow(),
-                ActionButtons(),
+                ManualControlSection(),
                 ScrollTestModeControls(),
                 new Border
                 {
-                    Padding = new Avalonia.Thickness(16),
+                    Padding = new Avalonia.Thickness(10),
                     CornerRadius = new Avalonia.CornerRadius(8),
                     Classes = { "status-card" },
                     Child = _status
@@ -116,6 +120,12 @@ public sealed class MainWindow : Window
         _captureTargetButton.Click += (_, _) => ArmTargetCapture();
         _clearTargetButton.Click += (_, _) => ClearTarget();
         _themeToggleButton.Click += (_, _) => ToggleTheme();
+        _gestureStudioButton.Click += (_, _) => OpenGestureStudio();
+        if (!OperatingSystem.IsWindows())
+        {
+            _gestureStudioButton.IsEnabled = false;
+            _gestureStudioButton.Content = "Gesture Studio (Windows only)";
+        }
         _startTrackingButton.IsEnabled = OperatingSystem.IsWindows();
         if (!OperatingSystem.IsWindows()) _trackingStatus.Text = "Local webcam tracking is available on Windows only.";
         _startTrackingButton.Click += async (_, _) => await StartTrackingAsync();
@@ -142,46 +152,126 @@ public sealed class MainWindow : Window
             _landmarkCollector.DisposeAsync().AsTask().GetAwaiter().GetResult();
             _handTracking.DisposeAsync().AsTask().GetAwaiter().GetResult();
         };
-        Content = new ScrollViewer { Content = controls };
+        Closing += OnMainClosing;
+        Content = new ScrollViewer
+        {
+            HorizontalScrollBarVisibility = Avalonia.Controls.Primitives.ScrollBarVisibility.Disabled,
+            VerticalScrollBarVisibility = Avalonia.Controls.Primitives.ScrollBarVisibility.Auto,
+            Content = controls
+        };
         UpdateResourceMetrics();
         _resourceTimer.Start();
     }
 
+    private void OpenGestureStudio()
+    {
+        if (_gestureStudioWindow is { IsVisible: true })
+        {
+            _gestureStudioWindow.Activate();
+            return;
+        }
+
+        var window = new GestureStudioWindow(_handTracking);
+        _gestureStudioWindow = window;
+        window.Closed += (_, _) =>
+        {
+            if (ReferenceEquals(_gestureStudioWindow, window)) _gestureStudioWindow = null;
+        };
+        window.Show(this);
+    }
+
+    private async void OnMainClosing(object? sender, CancelEventArgs args)
+    {
+        if (_allowMainClose) return;
+        args.Cancel = true;
+        if (_mainCloseInProgress) return;
+        _mainCloseInProgress = true;
+        if (_gestureStudioWindow is { IsVisible: true } studio)
+            await studio.CloseForOwnerAsync();
+        _allowMainClose = true;
+        Close();
+    }
+
     private Control HandTrackingControls() => new Border
     {
-        Padding = new Avalonia.Thickness(16),
+        Padding = new Avalonia.Thickness(12),
         CornerRadius = new Avalonia.CornerRadius(8),
         Classes = { "section-card" },
         Child = new StackPanel
         {
-            Spacing = 10,
+            Spacing = 7,
             Children =
             {
-                new TextBlock { Text = "Local hand tracking", FontSize = 20, FontWeight = FontWeight.Medium },
-                new TextBlock { Text = "Camera access starts only when requested. One hand and its 21 landmarks are shown locally; tracking never controls the desktop.", TextWrapping = TextWrapping.Wrap },
-                new TextBlock { Text = "Preferred hand: Right hand only", FontWeight = FontWeight.Medium },
-                new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8, Children = { _startTrackingButton, _stopTrackingButton, _resetHandSelectionButton } },
-                new TextBlock { Text = "Local landmark data collection", FontSize = 16, FontWeight = FontWeight.Medium },
-                new TextBlock { Text = "Collect labeled 21-point samples to a local JSONL file. Collection starts only on request and never triggers computer-control actions.", TextWrapping = TextWrapping.Wrap },
-                new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8, Children = { _gestureLabel, _startCollectionButton, _stopCollectionButton } },
-                _collectionStatus,
+                new TextBlock { Text = "Local hand tracking", FontSize = 19, FontWeight = FontWeight.SemiBold },
+                new TextBlock { Text = "Right hand only • camera and local inference start on request", TextWrapping = TextWrapping.Wrap, FontSize = 13 },
+                new WrapPanel { Orientation = Orientation.Horizontal, Children = { _startTrackingButton, _stopTrackingButton, _resetHandSelectionButton } },
                 _trackingStatus,
-                _handPreview,
-                new TextBlock { Text = "Index-finger pointer prototype (simulation only)", FontSize = 16, FontWeight = FontWeight.Medium },
-                new TextBlock { Text = "Extend the index finger while curling the other fingers. Only fingertip 8 is used. Adjust the yellow movement window; the simulated desktop never sends OS input.", TextWrapping = TextWrapping.Wrap },
-                new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8, Children = { new TextBlock { Text = "Window left", VerticalAlignment = VerticalAlignment.Center, Width = 90 }, _windowLeft } },
-                new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8, Children = { new TextBlock { Text = "Window top", VerticalAlignment = VerticalAlignment.Center, Width = 90 }, _windowTop } },
-                new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8, Children = { new TextBlock { Text = "Window width", VerticalAlignment = VerticalAlignment.Center, Width = 90 }, _windowWidth } },
-                new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8, Children = { new TextBlock { Text = "Window height", VerticalAlignment = VerticalAlignment.Center, Width = 90 }, _windowHeight } },
-                new StackPanel { Orientation = Orientation.Horizontal, Spacing = 12, Children = { _pointerToggleButton, _pointerStatus } },
-                _simulatedDesktop
+                CameraAndResourceMonitorRow(),
+                DiagnosticsSection(),
+                LandmarkCollectionSection(),
+                PointerSimulationSection()
             }
         }
     };
 
+    private Control CameraAndResourceMonitorRow()
+    {
+        _resourceMonitorPanel = (Border)ResourceMonitorControls();
+        _cameraResourceGrid = new Grid
+        {
+            ColumnDefinitions = new ColumnDefinitions
+            {
+                new ColumnDefinition(new GridLength(2.15, GridUnitType.Star)),
+                new ColumnDefinition(new GridLength(1, GridUnitType.Star))
+            },
+            RowDefinitions = new RowDefinitions { new RowDefinition(GridLength.Auto) }
+        };
+        _cameraResourceGrid.Children.Add(_handPreview);
+        _cameraResourceGrid.Children.Add(_resourceMonitorPanel);
+        Grid.SetColumn(_handPreview, 0);
+        Grid.SetColumn(_resourceMonitorPanel, 1);
+        _cameraResourceGrid.SizeChanged += (_, args) => UpdateCameraResourceLayout(args.NewSize.Width);
+        return _cameraResourceGrid;
+    }
+
+    private void UpdateCameraResourceLayout(double availableWidth)
+    {
+        if (_cameraResourceGrid is null || _resourceMonitorPanel is null) return;
+        var stacked = availableWidth < 780;
+        if (_cameraResourceStacked == stacked) return;
+        _cameraResourceStacked = stacked;
+
+        _cameraResourceGrid.ColumnDefinitions.Clear();
+        _cameraResourceGrid.RowDefinitions.Clear();
+        if (stacked)
+        {
+            _cameraResourceGrid.ColumnDefinitions.Add(new ColumnDefinition(new GridLength(1, GridUnitType.Star)));
+            _cameraResourceGrid.RowDefinitions.Add(new RowDefinition(GridLength.Auto));
+            _cameraResourceGrid.RowDefinitions.Add(new RowDefinition(GridLength.Auto));
+            Grid.SetColumn(_handPreview, 0);
+            Grid.SetRow(_handPreview, 0);
+            Grid.SetColumn(_resourceMonitorPanel, 0);
+            Grid.SetRow(_resourceMonitorPanel, 1);
+            _handPreview.Margin = new Avalonia.Thickness(0, 0, 0, 8);
+            _resourceMonitorPanel.Margin = default;
+        }
+        else
+        {
+            _cameraResourceGrid.ColumnDefinitions.Add(new ColumnDefinition(new GridLength(2.15, GridUnitType.Star)));
+            _cameraResourceGrid.ColumnDefinitions.Add(new ColumnDefinition(new GridLength(1, GridUnitType.Star)));
+            _cameraResourceGrid.RowDefinitions.Add(new RowDefinition(GridLength.Auto));
+            Grid.SetColumn(_handPreview, 0);
+            Grid.SetRow(_handPreview, 0);
+            Grid.SetColumn(_resourceMonitorPanel, 1);
+            Grid.SetRow(_resourceMonitorPanel, 0);
+            _handPreview.Margin = new Avalonia.Thickness(0, 0, 6, 0);
+            _resourceMonitorPanel.Margin = new Avalonia.Thickness(6, 0, 0, 0);
+        }
+    }
+
     private Control ResourceMonitorControls() => new Border
     {
-        Padding = new Avalonia.Thickness(14),
+        Padding = new Avalonia.Thickness(10),
         CornerRadius = new Avalonia.CornerRadius(8),
         Classes = { "section-card" },
         Child = new StackPanel
@@ -189,17 +279,95 @@ public sealed class MainWindow : Window
             Spacing = 5,
             Children =
             {
-                new TextBlock { Text = "Resource monitor", FontWeight = FontWeight.Medium },
-                _processCpuMetric,
-                _memoryMetric,
-                _inferenceMetric,
-                _trackingRateMetric,
-                _droppedFramesMetric,
-                new TextBlock { Text = "Tracking diagnostics (session totals; reset before a test)", FontWeight = FontWeight.Medium, Margin = new Avalonia.Thickness(0, 6, 0, 0) },
-                _trackingDiagnostics,
-                _resetDiagnosticsButton
+                new TextBlock { Text = "Resource monitor", FontWeight = FontWeight.SemiBold, FontSize = 15 },
+                new StackPanel
+                {
+                    Spacing = 3,
+                    Children = { _processCpuMetric, _memoryMetric, _inferenceMetric, _trackingRateMetric, _droppedFramesMetric }
+                }
             }
         }
+    };
+
+    private Control DiagnosticsSection() => ExpanderSection(
+        "Tracking diagnostics",
+        new StackPanel
+        {
+            Spacing = 4,
+            Children = { _trackingDiagnostics, _resetDiagnosticsButton }
+        },
+        initiallyExpanded: false,
+        summary: _trackingDiagnosticsSummary);
+
+    private Control LandmarkCollectionSection() => ExpanderSection(
+        "Landmark collection",
+        new StackPanel
+        {
+            Spacing = 5,
+            Children =
+            {
+                new TextBlock { Text = "Collect labeled 21-point samples to a local JSONL file. Collection is opt-in and never triggers computer-control actions.", TextWrapping = TextWrapping.Wrap, FontSize = 13 },
+                new WrapPanel { Orientation = Orientation.Horizontal, Children = { _gestureLabel, _startCollectionButton, _stopCollectionButton } },
+                _collectionStatus
+            }
+        });
+
+    private Control PointerSimulationSection() => ExpanderSection(
+        "Index-finger pointer simulation",
+        new StackPanel
+        {
+            Spacing = 5,
+            Children =
+            {
+                new TextBlock { Text = "Simulation only: the fingertip moves a marker and never sends OS input.", TextWrapping = TextWrapping.Wrap, FontSize = 13 },
+                new WrapPanel { Orientation = Orientation.Horizontal, Children = { _pointerToggleButton, _pointerStatus } },
+                new WrapPanel
+                {
+                    Orientation = Orientation.Horizontal,
+                    ItemWidth = 310,
+                    Children =
+                    {
+                        SliderRow("Window left", _windowLeft), SliderRow("Window top", _windowTop),
+                        SliderRow("Window width", _windowWidth), SliderRow("Window height", _windowHeight)
+                    }
+                },
+                _simulatedDesktop
+            }
+        });
+
+    private Control ManualControlSection() => ExpanderSection(
+        "Manual Windows controls",
+        new StackPanel
+        {
+            Spacing = 7,
+            Children =
+            {
+                new TextBlock { Text = "Each control performs one explicit action. Nothing runs automatically.", TextWrapping = TextWrapping.Wrap, FontSize = 13 },
+                LaunchRow(),
+                CoordinateRow(),
+                ActionButtons()
+            }
+        });
+
+    private static Control ExpanderSection(string heading, Control content, bool initiallyExpanded = false, Control? summary = null)
+    {
+        var header = new StackPanel { Spacing = 2, Children = { new TextBlock { Text = heading, FontWeight = FontWeight.Medium, FontSize = 14 } } };
+        if (summary is not null) header.Children.Add(summary);
+        return new Border
+        {
+            Padding = new Avalonia.Thickness(9, 7),
+            CornerRadius = new Avalonia.CornerRadius(7),
+            Classes = { "section-card" },
+            Child = new Expander { Header = header, Content = content, IsExpanded = initiallyExpanded }
+        };
+    }
+
+    private static Control SliderRow(string label, Slider slider) => new StackPanel
+    {
+        Orientation = Orientation.Horizontal,
+        Spacing = 6,
+        Margin = new Avalonia.Thickness(0, 0, 8, 2),
+        Children = { new TextBlock { Text = label, VerticalAlignment = VerticalAlignment.Center, Width = 82 }, slider }
     };
 
     private void OnResourceTimerTick(object? sender, EventArgs args) => UpdateResourceMetrics();
@@ -250,11 +418,12 @@ public sealed class MainWindow : Window
             : diagnostics.LastRejectedHandednessScore is { } score
                 ? $"no selected hand; last rejected handedness score {score:P0} (confidence {diagnostics.LastRejectedHandednessConfidence:P0})"
                 : "no selected-hand confidence available";
+        _trackingDiagnosticsSummary.Text = $"{diagnostics.CurrentState} • selected {diagnostics.FramesWithSelectedHand:N0} • no pose {diagnostics.FramesWithNoCandidate:N0} • lost {diagnostics.FramesWithTemporarilyLostHand:N0}";
         _trackingDiagnostics.Text = $"State: {diagnostics.CurrentState} • {diagnostics.CurrentMessage}\n"
+            + $"Frames: selected {diagnostics.FramesWithSelectedHand:N0} • no valid pose candidate {diagnostics.FramesWithNoCandidate:N0} • temporarily lost lock {diagnostics.FramesWithTemporarilyLostHand:N0}\n"
             + $"Palm candidates: score-qualified {diagnostics.PalmCandidatesBeforeNms:N0} → after NMS {diagnostics.PalmCandidatesAfterNms:N0} → top-four {diagnostics.PalmCandidatesAfterLimit:N0}\n"
             + $"Crops skipped: {diagnostics.InvalidCropsSkipped:N0} • pose processed: {diagnostics.HandPoseCandidatesProcessed:N0} • rejected by presence (<80%): {diagnostics.RejectedByPresenceThreshold:N0}\n"
             + $"Rejected by handedness: {diagnostics.RejectedByHandedness:N0} • spatial association: {diagnostics.RejectedBySpatialAssociation:N0}\n"
-            + $"Frames: selected {diagnostics.FramesWithSelectedHand:N0} • no valid pose candidate {diagnostics.FramesWithNoCandidate:N0} • temporarily lost lock {diagnostics.FramesWithTemporarilyLostHand:N0}\n"
             + selected;
     }
 
@@ -433,22 +602,17 @@ public sealed class MainWindow : Window
         _collectionStatus.Text = $"{status.Message} Samples saved: {status.SamplesWritten:N0} • skipped: {status.SamplesDropped:N0}.{path}";
     }
 
-    private Control ScrollTestModeControls() => new Border
-    {
-        Padding = new Avalonia.Thickness(16),
-        CornerRadius = new Avalonia.CornerRadius(8),
-        Classes = { "section-card" },
-        Child = new StackPanel
+    private Control ScrollTestModeControls() => ExpanderSection(
+        "Keyboard scroll test",
+        new StackPanel
         {
-            Spacing = 10,
+            Spacing = 7,
             Children =
             {
-                new TextBlock { Text = "Keyboard scroll test mode", FontSize = 18, FontWeight = FontWeight.Medium },
-                new TextBlock { Text = "Enable only when ready. Choose Capture Target Window, move the pointer over scrollable content, then press its capture shortcut. Scroll events are posted to the captured child window; HandsFree will not move the pointer or change focus.", TextWrapping = TextWrapping.Wrap },
-                new StackPanel
+                new TextBlock { Text = "Enable only when ready. Capture a window under the pointer, then use the configured one-shot scroll shortcuts. HandsFree will not move the pointer or change focus.", TextWrapping = TextWrapping.Wrap, FontSize = 13 },
+                new WrapPanel
                 {
                     Orientation = Orientation.Horizontal,
-                    Spacing = 8,
                     Children =
                     {
                         new TextBlock { Text = "Capture", VerticalAlignment = VerticalAlignment.Center },
@@ -459,22 +623,17 @@ public sealed class MainWindow : Window
                         _scrollUpShortcut
                     }
                 },
-                new StackPanel
+                new WrapPanel
                 {
-                    Orientation = Orientation.Horizontal,
-                    Spacing = 8,
                     Children = { _captureTargetButton, _clearTargetButton }
                 },
                 _targetStatus,
-                new StackPanel
+                new WrapPanel
                 {
-                    Orientation = Orientation.Horizontal,
-                    Spacing = 12,
                     Children = { _scrollModeButton, _scrollModeStatus }
                 }
             }
-        }
-    };
+        });
 
     private void ToggleScrollTestMode()
     {
@@ -563,20 +722,18 @@ public sealed class MainWindow : Window
 
     private Control LaunchRow()
     {
-        var button = new Button { Content = "Launch", MinWidth = 92 };
+        var button = new Button { Content = "Launch", MinWidth = 78, MinHeight = 32 };
         button.Click += async (_, _) => await ExecuteAsync(new LaunchApplicationAction(_executablePath.Text ?? string.Empty));
-        return new StackPanel
+        return new WrapPanel
         {
             Orientation = Orientation.Horizontal,
-            Spacing = 8,
             Children = { _executablePath, button }
         };
     }
 
-    private Control CoordinateRow() => new StackPanel
+    private Control CoordinateRow() => new WrapPanel
     {
         Orientation = Orientation.Horizontal,
-        Spacing = 8,
         Children =
         {
             new TextBlock { Text = "X", VerticalAlignment = VerticalAlignment.Center },
@@ -590,8 +747,8 @@ public sealed class MainWindow : Window
     private Control ActionButtons() => new WrapPanel
     {
         Orientation = Orientation.Horizontal,
-        ItemWidth = 112,
-        ItemHeight = 42,
+        ItemWidth = 100,
+        ItemHeight = 36,
         Children =
         {
             CreateButton("Left click", () => ExecuteAsync(new ClickAction(MouseButton.Left))),
@@ -603,7 +760,7 @@ public sealed class MainWindow : Window
 
     private static Button CreateButton(string label, Func<Task> action)
     {
-        var button = new Button { Content = label, Margin = new Avalonia.Thickness(0, 0, 8, 8) };
+        var button = new Button { Content = label, MinWidth = 92, MinHeight = 30, Margin = new Avalonia.Thickness(0, 0, 7, 6) };
         button.Click += async (_, _) => await action();
         return button;
     }
